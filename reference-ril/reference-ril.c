@@ -2198,7 +2198,15 @@ static void requestScreenState(void *data, size_t datalen, RIL_Token t)
         }
     }
 #endif
-
+	if (((int *)data)[0]) {
+		LOGE("exit sleep.....\n");
+		at_send_command("AT+CREG=2", NULL);
+		at_send_command("AT+CGREG=2", NULL);
+	}else {
+		LOGE("entry sleep ....\n");
+		at_send_command("AT+CREG=0", NULL);
+		at_send_command("AT+CGREG=0", NULL);
+	}
     RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
 }
 
