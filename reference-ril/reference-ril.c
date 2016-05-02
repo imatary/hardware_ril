@@ -2204,6 +2204,7 @@ static void requestScreenState(void *data, size_t datalen, RIL_Token t)
 		at_send_command("AT+CGREG=2", NULL);
 	}else {
 		LOGE("entry sleep ....\n");
+		at_send_command("AT+QSCLK=1", NULL);
 		at_send_command("AT+CREG=0", NULL);
 		at_send_command("AT+CGREG=0", NULL);
 	}
@@ -4482,15 +4483,18 @@ static int isRadioOn()
 
     if (err < 0 || p_response->success == 0) {
         // assume radio is off
+        LOGE("1err=%d\n", err);
         goto error;
     }
 
     line = p_response->p_intermediates->line;
 
     err = at_tok_start(&line);
+	LOGE("2err=%d\n", err);
     if (err < 0) goto error;
 
     err = at_tok_nextbool(&line, &ret);
+	LOGE("3err=%d\n", err);
     if (err < 0) goto error;
 
     at_response_free(p_response);
