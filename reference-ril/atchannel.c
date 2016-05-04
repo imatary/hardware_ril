@@ -30,20 +30,8 @@
 #include <unistd.h>
 
 #define LOG_NDEBUG 0
-#define LOG_TAG "AT"
-#include <utils/Log.h>
-
-#if 1 //quectel PLATFORM_VERSION >= "4.2.2"
-#ifndef LOGD
-#define LOGD ALOGD
-#endif
-#ifndef LOGE
-#define LOGE ALOGE
-#endif
-#ifndef LOGI
-#define LOGI ALOGI
-#endif
-#endif
+#define LOG_TAG "ATC"
+#include "ql-log.h"
 
 #if 1 //quectel
 #undef HAVE_ANDROID_OS
@@ -96,11 +84,14 @@ void  AT_DUMP(const char*  prefix, const char*  buff, int  len)
  */
 
 static pthread_mutex_t s_commandmutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t s_fwd_commandmutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t s_commandcond = PTHREAD_COND_INITIALIZER;
 
 static ATCommandType s_type;
 static const char *s_responsePrefix = NULL;
 static const char *s_smsPDU = NULL;
+static const char *s_raw_data = NULL;
+static size_t s_raw_len;
 static ATResponse *sp_response = NULL;
 
 static void (*s_onTimeout)(void) = NULL;
@@ -110,8 +101,8 @@ static int s_readerClosed;
 static void onReaderClosed();
 static int writeCtrlZ (const char *s);
 static int writeline (const char *s);
+static int writeraw (const char *s, size_t len);
 
-#ifndef USE_NP
 static void setTimespecRelative(struct timespec *p_ts, long long msec)
 {
     struct timeval tv;
@@ -124,7 +115,18 @@ static void setTimespecRelative(struct timespec *p_ts, long long msec)
     p_ts->tv_sec = tv.tv_sec + (msec / 1000);
     p_ts->tv_nsec = (tv.tv_usec + (msec % 1000) * 1000L ) * 1000L;
 }
-#endif /*USE_NP*/
+
+int pthread_cond_timeout_np(pthread_cond_t *cond,
+                            pthread_mutex_t * mutex,
+                            unsigned msecs) {
+    if (msecs != 0) {
+        struct timespec ts;
+        setTimespecRelative(&ts, msecs);
+        return pthread_cond_timedwait(cond, mutex, &ts);
+    } else {
+        return pthread_cond_wait(cond, mutex);
+    }
+}
 
 static void sleepMsec(long long msec)
 {
@@ -227,6 +229,7 @@ static const char * s_smsUnsoliciteds[] = {
     "+CBM:"
 #if 1 //quectel
     , "+CMTI:"
+    ,"^HCMT:" //cmda sms pdu
 #endif
 };
 static int isSMSUnsolicited(const char *line)
@@ -265,6 +268,10 @@ static void processLine(const char *line)
     if (sp_response == NULL) {
         /* no command pending */
         handleUnsolicited(line);
+    } else if (s_raw_data != NULL && 0 == strcmp(line, "CONNECT")) {
+        usleep(500*1000); //for EC20
+        writeraw(s_raw_data, s_raw_len);
+        s_raw_data = NULL;
     } else if (isFinalResponseSuccess(line)) {
         sp_response->success = 1;
         handleFinalResponse(line);
@@ -308,12 +315,6 @@ static void processLine(const char *line)
                 handleUnsolicited(line);
             }
         break;
-
-#if 1 //quectel
-        case OEM_HOOK_STRINGS:
-            addIntermediate(line);
-        break;
-  #endif
 
         default: /* this should never be reached */
             LOGE("Unsupported AT command type %d\n", s_type);
@@ -414,6 +415,7 @@ static const char *readline()
             s_readCount += count;
 
             p_read[count] = '\0';
+            p_read[count + 1] = '\0';
 
             // skip over leading newlines
             while (*s_ATBufferCur == '\r' || *s_ATBufferCur == '\n')
@@ -446,7 +448,6 @@ static const char *readline()
 
 static void onReaderClosed()
 {
-    LOGE("%s\n", __func__);
     if (s_onReaderClosed != NULL && s_readerClosed == 0) {
 
         pthread_mutex_lock(&s_commandmutex);
@@ -466,6 +467,11 @@ static void *readerLoop(void *arg)
 {
     for (;;) {
         const char * line;
+
+        if (s_tid_reader != pthread_self()) {
+            LOGE("%s s_tild_reader = %ld exit", __func__, pthread_self());
+            return NULL;
+        }
 
         line = readline();
 
@@ -504,6 +510,11 @@ static void *readerLoop(void *arg)
 #endif /*HAVE_ANDROID_OS*/
     }
 
+    if (s_tid_reader != pthread_self()) { //had closed by at timeout
+        LOGE("%s pthread_self = %ld exit", __func__, pthread_self());
+        return NULL;
+    }
+        
     onReaderClosed();
 
     return NULL;
@@ -610,6 +621,34 @@ static int writeCtrlZ (const char *s)
     return 0;
 }
 
+static int writeraw (const char *s, size_t len) {
+    size_t cur = 0;
+    ssize_t written;
+
+    if (s_fd < 0 || s_readerClosed > 0) {
+        return AT_ERROR_CHANNEL_CLOSED;
+    }
+
+    /* the main string */
+    while (cur < len) {
+        do {
+            written = write (s_fd, s + cur, len - cur);
+        } while (written < 0 && errno == EINTR);
+
+        if (written < 0) {
+            return AT_ERROR_GENERIC;
+        }
+
+        cur += written;
+    }
+
+    if (written < 0) {
+        return AT_ERROR_GENERIC;
+    }
+
+    return 0;
+}
+
 static void clearPendingCommand()
 {
     if (sp_response != NULL) {
@@ -684,7 +723,7 @@ int at_open(int fd, ATUnsolHandler h)
         perror ("pthread_create");
         return -1;
     }
-
+    LOGE("at_open s_tild_reader = %ld", s_tid_reader);
 
     return 0;
 }
@@ -693,11 +732,15 @@ int at_open(int fd, ATUnsolHandler h)
 void at_close()
 {
     LOGE("at_close");
+    
+    LOGE("at_close s_tild_reader = %ld", s_tid_reader);
+    s_tid_reader = 0;
+    
     if (s_fd >= 0) {
         close(s_fd);
     }
     s_fd = -1;
-
+    
     pthread_mutex_lock(&s_commandmutex);
 
     s_readerClosed = 1;
@@ -772,13 +815,29 @@ typedef struct {
 
 static const AT_TIMEOUT_T ql_at_timeout_table[] = {
     {"AT+COPS", 180},
-    {"AT+CMGS", 30},
+    {"AT+CMGS", 120},
+    {"AT+CMMS", 120},
+    {"AT+CMSS", 120},
+    {"AT+QCMGS", 120},
+    {"AT+QSMSS", 120},
+    {"AT+CGATT", 75},
+    {"AT+CGACT", 150},
+    {"AT+CLIP", 15},
+    {"AT+CLIR", 15},
+    {"AT+COLP", 15},
+    {"AT+CUSD", 120},
+    {"AT+CFUN", 15},
+    {"ATA", 90},
+    {"ATD", 5},
+    {"ATH", 90},
+    {"AT+CHUP", 90},
+    {"AT+QHUP", 90}
 };
 
 static long long ql_get_at_timeout(const char *command) {
     size_t i;
     char tmp[20];
-    long long timeoutMsec = 15 * 1000; //default 15s
+    long long timeoutMsec = 3 * 1000; //default 3s
 
     memset(tmp, 0, sizeof(tmp));
     strncpy(tmp, command, sizeof(tmp) - 1);
@@ -807,6 +866,7 @@ static int at_send_command_full_nolock (const char *command, ATCommandType type,
 
 //joe
 #if 1 //quectel // AT_TIMEOUT_LVL
+    int timeou_times = 0;
     if(timeoutMsec == 0) {        
         timeoutMsec = ql_get_at_timeout(command);
     }
@@ -845,6 +905,16 @@ static int at_send_command_full_nolock (const char *command, ATCommandType type,
             err = pthread_cond_wait(&s_commandcond, &s_commandmutex);
         }
 
+	if (err == ETIMEDOUT && timeou_times++ == 0 && s_fd > 0 &&  s_readerClosed == 0) {
+            LOGE("warnning - moderm no response, retry %s", command);
+            at_response_free(sp_response);
+            sp_response = at_response_new();
+            if (writeline (command) < 0) {
+                goto error;
+            }		
+            continue;
+	}
+
         if (err == ETIMEDOUT) {
             err = AT_ERROR_TIMEOUT;
             goto error;
@@ -867,6 +937,7 @@ static int at_send_command_full_nolock (const char *command, ATCommandType type,
     }
 
     err = 0;
+
 error:
     clearPendingCommand();
 
@@ -889,6 +960,7 @@ static int at_send_command_full (const char *command, ATCommandType type,
         return AT_ERROR_INVALID_THREAD;
     }
 
+    pthread_mutex_lock(&s_fwd_commandmutex);
     pthread_mutex_lock(&s_commandmutex);
 
     err = at_send_command_full_nolock(command, type,
@@ -896,6 +968,7 @@ static int at_send_command_full (const char *command, ATCommandType type,
                     timeoutMsec, pp_outResponse);
 
     pthread_mutex_unlock(&s_commandmutex);
+    pthread_mutex_unlock(&s_fwd_commandmutex);
 
     if (err == AT_ERROR_TIMEOUT && s_onTimeout != NULL) {
         s_onTimeout();
@@ -993,7 +1066,6 @@ int at_send_command_sms (const char *command,
     return err;
 }
 
-
 int at_send_command_multiline (const char *command,
                                 const char *responsePrefix,
                                  ATResponse **pp_outResponse)
@@ -1001,6 +1073,21 @@ int at_send_command_multiline (const char *command,
     int err;
 
     err = at_send_command_full (command, MULTILINE, responsePrefix,
+                                    NULL, 0, pp_outResponse);
+
+    return err;
+}
+
+int at_send_command_raw (const char *command,
+                                const char *raw_data, unsigned int raw_len,
+                                const char *responsePrefix,
+                                 ATResponse **pp_outResponse)
+{
+    int err;
+
+    s_raw_data = raw_data;
+    s_raw_len = raw_len;
+    err = at_send_command_full (command, SINGLELINE, responsePrefix,
                                     NULL, 0, pp_outResponse);
 
     return err;

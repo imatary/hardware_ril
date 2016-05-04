@@ -49,9 +49,6 @@ typedef enum {
     SINGLELINE,  /* a single intermediate response starting with a prefix */
     MULTILINE    /* multiple line intermediate response
                     starting with a prefix */
-#if 1 //quectel
-    , OEM_HOOK_STRINGS
-#endif
 } ATCommandType;
 
 /** a singly-lined list of intermediate responses */
@@ -98,6 +95,11 @@ int at_send_command_numeric (const char *command,
                                  ATResponse **pp_outResponse);
 
 int at_send_command_multiline (const char *command,
+                                const char *responsePrefix,
+                                 ATResponse **pp_outResponse);
+
+int at_send_command_raw (const char *command,
+                                const char *raw_data, unsigned int raw_len,
                                 const char *responsePrefix,
                                  ATResponse **pp_outResponse);
 

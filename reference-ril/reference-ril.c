@@ -20,6 +20,7 @@
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <pwd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -36,49 +37,36 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <sys/system_properties.h>
-#if 1 //quectel
 #include "../include/telephony/ril.h"
-#include <cutils/properties.h>
-#else
 
-#include "ril.h"
-#endif
-#include "hardware/qemu_pipe.h"
-
-#define LOG_TAG "RIL"
-#include <utils/Log.h>
-
-#if 1 //quectel PLATFORM_VERSION >= "4.2.2"
-#ifndef LOGD
-#define LOGD ALOGD
-#endif
-#ifndef LOGE
-#define LOGE ALOGE
-#endif
-#ifndef LOGI
-#define LOGI ALOGI
-#endif
-#endif
+#define LOG_NDEBUG 0
+#define LOG_TAG "RILC"
+#include "ql-log.h"
 
 #define MAX_AT_RESPONSE 0x1000
 
 #if 1 //quectel
 /* pathname returned from RIL_REQUEST_SETUP_DATA_CALL / RIL_REQUEST_SETUP_DEFAULT_PDP */
 //#define PPP_TTY_PATH "ppp0"
+#define CONFIG_DEFAULT_PDP 5
 static const char *PPP_TTY_PATH = "ppp0";
+static int s_default_pdp = 1;
 #define CUSD_USE_UCS2_MODE
-#define USB_HOST_SUSPEND_SUPPORT 1 //like s5pv210 donnot support usb suspend and wakeup
-#define REFERENCE_RIL_VERSION    "Quectel_Android_RIL_SR01A34"
+//#define USB_HOST_USE_RESET_RESUME //like s5pv210 donnot support usb suspend and wakeup
+#define REFERENCE_RIL_VERSION    "Quectel_Android_RIL_SR01A40V13"
 static  char ql_ttyAT[20];
 extern char * ql_get_ttyAT(char *out_ttyname);
-extern int ql_pppd_start(const char *modemport, const char *user, const char *password, const char *auth_type);
+#ifdef USE_NDIS
+extern int ql_pppd_start(const char *modemport, const char *user, const char *password, const char *auth_type, const char *ppp_number);
 extern int ql_pppd_stop(int signo);
-extern void ql_kill_pppd(int signo);
 extern int ql_get_ndisname(char **pp_usbnet_adapter);
-extern int ql_ndis_start(const char *modemport, const char *user, const char *password, const char *auth_type);
+extern int ql_ndis_start(const char *modemport, const char *user, const char *password, const char *auth_type, int default_pdp);
 extern int ql_ndis_stop(int signo);
-extern void ql_kill_ndis(int signo);
+#else
+static int ql_get_ndisname(char **pp_usbnet_adapter) { return -ENODEV; }
+static int ql_ndis_start(const char *apn, const char *user, const char *password, const char *auth_type) { return 0; }
+static int ql_ndis_stop(int signo) { return 0; }
+#endif
 static const char *ql_product_version = NULL;
 #define ql_is_XX(__ql_module_name) (!strncmp(ql_product_version, __ql_module_name, strlen(__ql_module_name)))
 static int ql_is_UC20 = 0;
@@ -89,15 +77,23 @@ static int ql_is_GSM = 0;
 static int network_debounce_time = 0;
 static int onRequestCount = 0;
 static int time_zone_report = 0;
-static const char* ql_nwscanmode = NULL;
-static const char* ql_nwscanseq = NULL;
-	
+static int s_lastPreferredNetworkType = -1;
+static int wait_for_powerdown = 0;
+static int bSetupDataCallCompelete = 0;
+static int nSetupDataCallFailTimes = 0;
+
+extern void ql_gps_init(void);
+extern void ql_fwdsvc_init(void);
+
 //#define QUECTEL_DEBUG
-#ifdef QUECTEL_DEBUG //quectel //for debug-purpose, record logcat msg to file
+#if 1//def QUECTEL_DEBUG //quectel //for debug-purpose, record logcat msg to file
 //you can fetch logfiles to host-pc by adb tools using command "adb pull /data/ql_log/"
 static void log_dmesg(const char *tag) {
-#if 0 // may take long time
-    if (fork() == 0) 
+#if 1 // may take long time
+    if (access("/data/ql_log", W_OK))
+        return;
+
+    if (fork() == 0)
     {
         char logcat_cmd[100];
         void *pbuf;;
@@ -109,13 +105,16 @@ static void log_dmesg(const char *tag) {
         timeinfo=localtime(&rawtime );
         sprintf(logcat_cmd, "/data/ql_log/%02d%02d_%02d%02d%02d_dmesg_%s.txt",
     		timeinfo->tm_mon+1, timeinfo->tm_mday, timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec, tag);
-        logfilefp = fopen(logcat_cmd, "wb");
-        dmesgfp = popen("dmesg", "r");
-        pbuf = malloc(8*1024);    
-        if (logfilefp && dmesgfp && pbuf) {
-            while((len = fread(pbuf, 1, 8*1024, dmesgfp)) > 0) {
-                LOGD("%s len = %d\n", __func__, len);
-                fwrite(pbuf, 1, len, logfilefp);
+        logfilefp = NULL; //fopen(logcat_cmd, "wb");
+        dmesgfp = popen("dmesg -c", "r");
+        pbuf = malloc(64*1024);
+        if (/*logfilefp && */dmesgfp && pbuf) {
+            while((len = fread(pbuf, 1, 64*1024, dmesgfp)) > 0) {
+                LOGD("%s len = %zd\n", __func__, len);
+                if (logfilefp == NULL)
+                    logfilefp = fopen(logcat_cmd, "wb");
+                if (logfilefp != NULL)
+                    fwrite(pbuf, 1, len, logfilefp);
         	}
         } else {
             LOGD("logfilefp=%p, dmesgfp=%p, errno: %d (%s)", logfilefp, dmesgfp, errno, strerror(errno));
@@ -144,14 +143,18 @@ static int currentDataServiceState(void) {
     return (gprsState == 1);
 }
 
+#define MUX_CHN_DIR "/data/misc/rild/" //selinux donot allow rild create files in /dev/chn
 int ql_mux_enabled = 0;
-#define CMUX_AT_PORT "/dev/chn/1" //"/dev/ttygsm1"
-#define CMUX_PPP_PORT "/dev/chn/2" //"/dev/ttygsm2"
+#define CMUX_AT_PORT MUX_CHN_DIR "1" //"/dev/ttygsm1"
+#define CMUX_PPP_PORT MUX_CHN_DIR "2" //"/dev/ttygsm2"
 static int cmux_speed = 115200;
 static int cmux_ctsrts = 0;
+#ifdef USE_MUXD
 extern int gsm0710muxd(const char *serialname, int speed, int ctsrts);
-//#undef RIL_VERSION
-//static int RIL_VERSION = 6;
+#else
+int gsm0710muxd(const char *serialname, int speed, int ctsrts) { return -EEXIST; }
+#endif
+static int QL_RIL_VERSION = RIL_VERSION;
 #endif
 
 typedef enum {
@@ -173,11 +176,10 @@ static SIM_Status getSIMStatus();
 static int getCardStatus(RIL_CardStatus_v6 **pp_card_status);
 static void freeCardStatus(RIL_CardStatus_v6 *p_card_status);
 static void onDataCallListChanged(void *param);
-
-extern const char * requestToString(int request);
+static void requestDeactivateDefaultPDP(void *data, size_t datalen, RIL_Token t);
 
 /*** Static Variables ***/
-static const RIL_RadioFunctions s_callbacks = {
+static RIL_RadioFunctions s_callbacks = {
     RIL_VERSION,
     onRequest,
     currentState,
@@ -192,6 +194,10 @@ static const struct RIL_Env *s_rilenv;
 #define RIL_onRequestComplete(t, e, response, responselen) s_rilenv->OnRequestComplete(t,e, response, responselen)
 #define RIL_onUnsolicitedResponse(a,b,c) s_rilenv->OnUnsolicitedResponse(a,b,c)
 #define RIL_requestTimedCallback(a,b,c) s_rilenv->RequestTimedCallback(a,b,c)
+void RILC_requestTimedCallback (RIL_TimedCallback callback, void *param,
+                                const struct timeval *relativeTime) {
+    RIL_requestTimedCallback (callback, param, relativeTime);
+}
 #endif
 
 static RIL_RadioState sState = RADIO_STATE_UNAVAILABLE;
@@ -205,6 +211,7 @@ static int          s_device_socket = 0;
 
 /* trigger change to this with s_state_cond */
 static int s_closed = 0;
+static int s_recovery_mode = 0;
 
 static int sFD;     /* file desc of AT channel */
 static char sATBuffer[MAX_AT_RESPONSE+1];
@@ -213,6 +220,8 @@ static char *sATBufferCur = NULL;
 static const struct timeval TIMEVAL_SIMPOLL = {1,0};
 static const struct timeval TIMEVAL_CALLSTATEPOLL = {0,500000};
 static const struct timeval TIMEVAL_0 = {0,0};
+static const struct timeval TIMEVAL_1 = {1,0};
+static const struct timeval TIMEVAL_3 = {3,0};
 
 static void onSIMStateChange (void *param);
 static void onSMSReady(void *param);
@@ -223,9 +232,9 @@ static void setRadioState(RIL_RadioState newState);
 static unsigned int ussd_pending_index = 0;
 static const struct timeval ussd_timeout_timeval = {30,0}; //seconds
 static void onUssdResponse(char *mode) {
-    char *response[2]; 
+    char *response[2];
     response[0] = mode;
-       
+
     switch (mode[0] - '0') {
         case 2:
             response[1] = "USSD terminated by network";
@@ -239,12 +248,12 @@ static void onUssdResponse(char *mode) {
         case 5:
         default:
             response[1] = "Network time out";
-        break;      
+        break;
     }
     RIL_onUnsolicitedResponse(RIL_UNSOL_ON_USSD, response, sizeof(response[0]) + sizeof(response[1]));
 }
 static void onUssdTimedCallback(void *param) {
-    if (ussd_pending_index != ((unsigned int) param))
+    if (ussd_pending_index != *((unsigned int *) param))
         return;
     at_send_command("AT+CUSD=2", NULL); //cancel
     onUssdResponse("5");
@@ -317,15 +326,15 @@ static int ucs2_to_utf8( cbytes_t  ucs2, int       ucs2len, bytes_t   buf ) {
     return result;
 }
 
-static int quectel_at_cops(void) {
+static int quectel_at_cops(int response[4]) {
     int err;
     ATResponse *p_response = NULL;
-    int response = 0;
     char *line;
-    int mode, format, act = 0;
     char *oper;
 
-    err = at_send_command_singleline("AT+COPS?", "+COPS:", &p_response);
+    response[0] = response[1] = response[2] = response[3] = 0;
+
+    err = at_send_command_singleline("AT+COPS=3,2;+COPS?", "+COPS:", &p_response);
     if ((err < 0) ||  (p_response == NULL) || (p_response->success == 0))
         goto error;
 
@@ -335,30 +344,92 @@ static int quectel_at_cops(void) {
     if (err < 0) goto error;
 
 //+COPS:<mode>[,<format>[,<oper>][,<Act>]]
-    err = at_tok_nextint(&line, &mode);
+    err = at_tok_nextint(&line, &response[0]);
     if (err < 0) goto error;
 
     if (!at_tok_hasmore(&line)) goto error;
 
-    err = at_tok_nextint(&line, &format);
+    err = at_tok_nextint(&line, &response[1]);
     if (err < 0) goto error;
 
     if (!at_tok_hasmore(&line)) goto error;
 
     err = at_tok_nextstr(&line, &oper);
     if (err < 0) goto error;
+    response[2] = atoi(oper);
 
     if (!at_tok_hasmore(&line)) goto error;
 
-    err = at_tok_nextint(&line, &act);
+    err = at_tok_nextint(&line, &response[3]);
     if (err < 0) goto error;
 
 error:
      at_response_free(p_response);
-     return act;
+     return response[3];
 }
 
-static int quectel_at_creg(int response[4])  {
+static int quectel_at_qnwinfo(void) {
+    int err;
+    ATResponse *p_response = NULL;
+    char *line;
+    int radio_tech = RADIO_TECH_1xRTT;
+    char *act_str;
+
+    err = at_send_command_singleline("AT+QNWINFO", "+QNWINFO:", &p_response);
+    if ((err < 0) ||  (p_response == NULL) || (p_response->success == 0))
+        goto error;
+
+    line = p_response->p_intermediates->line;
+
+    err = at_tok_start(&line);
+    if (err < 0) goto error;
+
+//+QNWINFO: <Act>,<oper>,<band>,<channel>
+    err = at_tok_nextstr(&line, &act_str);
+    if (err < 0) goto error;
+
+    if (!strcmp(act_str, "NONE")) {
+        radio_tech = RADIO_TECH_UNKNOWN;
+    } else if (!strcmp(act_str, "CDMA1X")) {
+        radio_tech = RADIO_TECH_1xRTT;
+    } else if (!strcmp(act_str, "CDMA1X AND HDR")) {
+        radio_tech = RADIO_TECH_EVDO_A;
+    } else if (!strcmp(act_str, "CDMA1X AND EHRPD")) {
+        radio_tech = RADIO_TECH_EHRPD;
+    } else if (!strcmp(act_str, "HDR")) {
+        radio_tech = RADIO_TECH_EVDO_A;
+    } else if (!strcmp(act_str, "HDR-EHRPD")) {
+        radio_tech = RADIO_TECH_EHRPD;
+    } else if (!strcmp(act_str, "GSM")) {
+        radio_tech = RADIO_TECH_GPRS;
+    } else if (!strcmp(act_str, "GPRS")) {
+        radio_tech = RADIO_TECH_GPRS;
+    } else if (!strcmp(act_str, "EDGE")) {
+        radio_tech = RADIO_TECH_EDGE;
+    } else if (!strcmp(act_str, "WCDMA")) {
+        radio_tech = RADIO_TECH_UMTS;
+    } else if (!strcmp(act_str, "HSDPA")) {
+        radio_tech = RADIO_TECH_HSDPA;
+    } else if (!strcmp(act_str, "HSUPA")) {
+        radio_tech = RADIO_TECH_HSUPA;
+    } else if (!strcmp(act_str, "HSPA+")) {
+        radio_tech = RADIO_TECH_HSPAP;
+    } else if (!strcmp(act_str, "TDSCDMA")) {
+        radio_tech = RADIO_TECH_UMTS;
+    } else if (!strcmp(act_str, "TDD LTE")) {
+        radio_tech = RADIO_TECH_LTE;
+    } else if (!strcmp(act_str, "FDD LTE")) {
+        radio_tech = RADIO_TECH_LTE;
+    } else {
+        radio_tech = RADIO_TECH_1xRTT;
+    }
+
+error:
+     at_response_free(p_response);
+     return radio_tech;
+}
+
+static int quectel_at_cgreg(int response[4])  {
     int err;
     ATResponse *p_response = NULL;
     char *line;
@@ -368,7 +439,7 @@ static int quectel_at_creg(int response[4])  {
 
     response[0] = response[1] = response[2] = response[3] = 0;
 
-    err = at_send_command_singleline("AT+CREG?", "+CREG:", &p_response);
+    err = at_send_command_singleline("AT+CGREG?", "+CGREG:", &p_response);
     if ((err < 0) ||  (p_response == NULL) || (p_response->success == 0))
         goto error;
 
@@ -376,25 +447,55 @@ static int quectel_at_creg(int response[4])  {
 
     err = at_tok_start(&line);
     if (err < 0) goto error;
-    
+
     err = at_tok_nextint(&line, &skip);
     if (err < 0) goto error;
-    
+
     err = at_tok_nextint(&line, &response[0]);
     if (err < 0) goto error;
-    
+
     err = at_tok_nexthexint(&line, &response[1]);
     if (err < 0) goto error;
-    
+
     err = at_tok_nexthexint(&line, &response[2]);
     if (err < 0) goto error;
-    
+
     err = at_tok_nexthexint(&line, &response[3]);
     if (err < 0) goto error;
-    
+
 error:
     at_response_free(p_response);
     return 0;
+}
+
+//Only can be used on EC20 now, to check the status of PPP link layer
+static void quectel_at_datamode(void)
+{
+	int err;
+	ATResponse *p_response = NULL;
+	char *line;
+	int ppp_status; // 0-> disconnect, 1->connect
+
+	err = at_send_command_singleline("AT^DATAMODE", "^DATAMODE:",&p_response);
+	if((err < 0) || (p_response == NULL) || (p_response->success == 0))
+		goto error;
+
+	line = p_response->p_intermediates->line;
+
+	err = at_tok_start(&line);
+	if(err < 0) goto error;
+
+	err = at_tok_nextint(&line, &ppp_status);
+	if(err < 0) goto error;
+
+	if(!ppp_status)
+	{
+            LOGE("!!!PPP link is disconnected after sleep mode");
+            ql_pppd_stop(SIGTERM);
+	}
+
+error:
+	at_response_free(p_response);
 }
 #endif
 
@@ -486,7 +587,7 @@ static void onRadioPowerOn()
 static void onSIMReady()
 {
     onSMSReady(NULL);
-    
+
     /*  Call Waiting notifications */
     at_send_command("AT+CCWA=1", NULL);
 
@@ -510,6 +611,10 @@ static void onSIMReady()
     at_send_command("AT+CUSD=1", NULL);
 
     at_send_command("AT+CGEREP=0", NULL); //carl tmp disable
+
+    at_send_command("AT+CGEREP=0", NULL); //carl tmp disable
+
+    RIL_onUnsolicitedResponse (RIL_UNSOL_RESPONSE_SIM_STATUS_CHANGED, NULL, 0);
 }
 
 static void requestRadioPower(void *data, size_t datalen, RIL_Token t)
@@ -518,30 +623,52 @@ static void requestRadioPower(void *data, size_t datalen, RIL_Token t)
 
     int err;
     ATResponse *p_response = NULL;
-    
+
+	LOGE("%s begin.\n", __func__);
     assert (datalen >= sizeof(int *));
     onOff = ((int *)data)[0];
 
     if (onOff == 0 && sState != RADIO_STATE_OFF) {
- #if 1 //quectel        
+        const char SHUTDOWN_ACTION_PROPERTY[PROPERTY_VALUE_MAX] = "sys.shutdown.requested";
+        char shutdownAction[PROPERTY_VALUE_MAX];
+        if ((ql_is_UC20 || ql_is_EC20) && (property_get(SHUTDOWN_ACTION_PROPERTY, shutdownAction, NULL) > 0)) {
+            int timeout = 0;
+            LOGD("%s shutdownAction is %s", __func__, shutdownAction);
+#if 0 //quectel, i guess nobody like this, because it take long time waiting for moderm shutdown
+            err = at_send_command("AT+QPOWD", &p_response);
+            if (err < 0 || p_response->success == 0) goto error;
+            wait_for_powerdown = 1;
+            //timeout in ShutdownThread.java less than 15
+            while ((timeout < (15*10)) && (wait_for_powerdown != 3)) { //wait for urc "POWERED DOWN" and usb disconect
+                //LOGD("%s wait_for_powerdown %d %d", __func__, timeout++, wait_for_powerdown);
+                usleep(100*1000);
+            }
+            setRadioState(RADIO_STATE_OFF);
+            at_response_free(p_response);
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+            return;
+#endif
+        }
+#if 1 //quectel
        /**
          *  Wythe modify on 2013-10-8
          *  just switch off the RF. CFUN=0 will shutdown the simcard.
          */
         err = at_send_command("AT+CFUN=4", &p_response);
-#else   
+#else
         err = at_send_command("AT+CFUN=0", &p_response);
 #endif
-       if (err < 0 || p_response->success == 0) goto error;
+       if (err < 0 || ((p_response->success == 0) && strncmp(p_response->finalResponse, "NO CARRIER", strlen("NO CARRIER")))) goto error;
         setRadioState(RADIO_STATE_OFF);
+        //requestDeactivateDefaultPDP(NULL, 0, NULL);
     } else if (onOff > 0 && sState == RADIO_STATE_OFF) {
         err = at_send_command("AT+CFUN=1", &p_response);
-        if (err < 0|| p_response->success == 0) {     
+        if (err < 0|| p_response->success == 0) {
             // Some stacks return an error when there is no SIM,
             // but they really turn the RF portion on
             // So, if we get an error, let's check to see if it
             // turned on anyway
-            
+
             if (isRadioOn() != 1) {
                 goto error;
             }
@@ -551,9 +678,10 @@ static void requestRadioPower(void *data, size_t datalen, RIL_Token t)
 
     at_response_free(p_response);
     RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+	LOGE("%s end.\n", __func__);
     return;
 error:
-    LOGE("[%s] error", __func__);
+    LOGE("[%s] error, finalResponse = %s\n", __func__, p_response->finalResponse);
     at_response_free(p_response);
     RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
 }
@@ -568,6 +696,23 @@ static void onDataCallListChanged(void *param)
 static void requestDataCallList(void *data, size_t datalen, RIL_Token t)
 {
     requestOrSendDataCallList(&t);
+}
+
+static void onDataCallExit(void *param) {
+    if (bSetupDataCallCompelete == 0 && ql_is_EC20) {
+        int cgreg_response[4];
+        quectel_at_cgreg(cgreg_response);
+        if (cgreg_response[0] != 1 && cgreg_response[0] != 5) {
+            int cops_response[4];
+            quectel_at_cops(cops_response);
+            if (cops_response[3] == 7) { //lte moe
+                at_send_command("AT+CGDCONT=1,\"IPV4V6\",\"\"",  NULL);
+                at_send_command("AT+CGATT=0",  NULL);
+                at_send_command("AT+CGATT=1",  NULL);
+           }
+        }
+    }
+    RIL_onUnsolicitedResponse(RIL_UNSOL_DATA_CALL_LIST_CHANGED, NULL, 0);
 }
 
 static void get_local_ip(char *local_ip) {
@@ -592,16 +737,39 @@ error:
 
 static void requestOrSendDataCallList(RIL_Token *t)
 {
-    ATResponse *p_response;
+    ATResponse *p_response = NULL;
     ATLine *p_cur;
     int err;
-    int n = 0;
     char *out;
     char propKey[PROPERTY_VALUE_MAX];
     char propValue[PROPERTY_VALUE_MAX];
+    char address[64] = "\0";
+    char dnses[128] = "\0";
+    char gateways[64] = "\0";
+
+    RIL_Data_Call_Response_v6 *responses = (RIL_Data_Call_Response_v6 *) malloc(sizeof(RIL_Data_Call_Response_v6) + 24);
+
+    responses[0].status = -1;
+    responses[0].suggestedRetryTime = -1;
+    responses[0].cid = 1;
+    responses[0].active = 0;
+    responses[0].type = (char *)"IP";
+    responses[0].ifname = (char *)PPP_TTY_PATH;
+    responses[0].addresses = (char *)"";
+    responses[0].dnses = (char *)"";
+    responses[0].gateways = (char *)"";
 
     err = at_send_command_multiline ("AT+CGACT?", "+CGACT:", &p_response);
-    if (err != 0 || p_response->success == 0) {
+    if (err != 0 || p_response == NULL || p_response->success == 0) {
+        if (ql_is_EC20) { //cdma donot support this at
+             responses[0].cid = s_default_pdp;
+             responses[0].active = 0;
+             get_local_ip(propValue);
+             if (strcmp(propValue, "0.0.0.0")) {
+                responses[0].active = 1;
+            }
+            goto __skip_CGACT;
+        }
         if (t != NULL)
             RIL_onRequestComplete(*t, RIL_E_GENERIC_FAILURE, NULL, 0);
         else
@@ -610,80 +778,7 @@ static void requestOrSendDataCallList(RIL_Token *t)
         return;
     }
 
-#if 1// quectel //Android only use CID 1
-    if ((p_cur = p_response->p_intermediates) != NULL)
-#else
-    for (p_cur = p_response->p_intermediates; p_cur != NULL;
-         p_cur = p_cur->p_next)
-#endif
-        n++;
-
-    RIL_Data_Call_Response_v6 *responses =
-        alloca(n * sizeof(RIL_Data_Call_Response_v6));
-
-    int i;
-    for (i = 0; i < n; i++) {
-        responses[i].status = -1;
-        responses[i].suggestedRetryTime = -1;
-        responses[i].cid = -1;
-        responses[i].active = -1;
-#if 1 //quectel
-        responses[i].type = (char *)"";
-        responses[i].ifname = (char *)PPP_TTY_PATH;
-        responses[i].addresses = (char *)"";
-        responses[i].dnses = (char *)"";
-        responses[i].gateways = (char *)"";
-#else
-        responses[i].type = "";
-        responses[i].ifname = "";
-        responses[i].addresses = "";
-        responses[i].dnses = "";
-        responses[i].gateways = "";
-#endif
-    }
-
-    RIL_Data_Call_Response_v6 *response = responses;
-#if 1 // quectel //Android only use CID 1
-    if ((p_cur = p_response->p_intermediates) != NULL) {
-#else
-    for (p_cur = p_response->p_intermediates; p_cur != NULL;
-         p_cur = p_cur->p_next) {
-#endif
-        char *line = p_cur->line;
-
-        err = at_tok_start(&line);
-        if (err < 0)
-            goto error;
-
-        err = at_tok_nextint(&line, &response->cid);
-        if (err < 0)
-            goto error;
-
-        err = at_tok_nextint(&line, &response->active);
-        if (err < 0)
-            goto error;
-
-        response++;
-    }
-
-    at_response_free(p_response);
-
-    err = at_send_command_multiline ("AT+CGDCONT?", "+CGDCONT:", &p_response);
-    if (err != 0 || p_response->success == 0) {
-        if (t != NULL)
-            RIL_onRequestComplete(*t, RIL_E_GENERIC_FAILURE, NULL, 0);
-        else
-            RIL_onUnsolicitedResponse(RIL_UNSOL_DATA_CALL_LIST_CHANGED,
-                                      NULL, 0);
-        return;
-    }
-
-#if 1 // quectel //Android only use CID 1
-    if ((p_cur = p_response->p_intermediates) != NULL) {
-#else
-    for (p_cur = p_response->p_intermediates; p_cur != NULL;
-         p_cur = p_cur->p_next) {
-#endif
+    for (p_cur = p_response->p_intermediates; p_cur != NULL; p_cur = p_cur->p_next) {
         char *line = p_cur->line;
         int cid;
 
@@ -695,75 +790,128 @@ static void requestOrSendDataCallList(RIL_Token *t)
         if (err < 0)
             goto error;
 
-        for (i = 0; i < n; i++) {
-            if (responses[i].cid == cid)
-                break;
-        }
+        if (cid != s_default_pdp)
+            continue;
 
-        //if (i >= n) {
-        //    /* details for a context we didn't hear about in the last request */
-        //    continue;
-        //}
+        responses[0].cid = cid;
+
+        err = at_tok_nextint(&line, &responses[0].active);
+        if (err < 0)
+            goto error;
+
+#if 1 //EC20 bug, if use same profile settings for pdp 1 & 5 and active pdp 5, but AT+CGACT? show pdp 5 is de-active
+        if ((ql_is_EC20 || ql_is_XX("EC25") || ql_is_XX("EC21"))&& responses[0].active == 0) {
+             get_local_ip(propValue);
+             if (strcmp(propValue, "0.0.0.0")) {
+                responses[0].active = 1;
+            }
+        }
+#endif
+    }
+
+__skip_CGACT:
+
+    at_response_free(p_response);
+
+    err = at_send_command_multiline ("AT+CGDCONT?", "+CGDCONT:", &p_response);
+    if (err != 0 || p_response == NULL || p_response->success == 0) {
+        if (t != NULL)
+            RIL_onRequestComplete(*t, RIL_E_GENERIC_FAILURE, NULL, 0);
+        else
+            RIL_onUnsolicitedResponse(RIL_UNSOL_DATA_CALL_LIST_CHANGED,
+                                      NULL, 0);
+        return;
+    }
+
+    for (p_cur = p_response->p_intermediates; p_cur != NULL; p_cur = p_cur->p_next) {
+        char *line = p_cur->line;
+        int cid;
+
+        err = at_tok_start(&line);
+        if (err < 0)
+            goto error;
+
+        err = at_tok_nextint(&line, &cid);
+        if (err < 0)
+            goto error;
+
+        if (cid != s_default_pdp)
+            continue;
 
         // Assume no error
-        responses[i].status = 0;
+        responses[0].status = 0;
 
         // type
         err = at_tok_nextstr(&line, &out);
         if (err < 0)
             goto error;
-        responses[i].type = alloca(strlen(out) + 1);
-        strcpy(responses[i].type, out);
+        responses[0].type = alloca(strlen(out) + 1);
+        strcpy(responses[0].type, out);
 
         // APN ignored for v5
         err = at_tok_nextstr(&line, &out);
         if (err < 0)
             goto error;
-
-        responses[i].ifname = strdup(PPP_TTY_PATH);
-
-        get_local_ip(propValue);
-        responses[i].addresses = strdup(propValue);
-
-        responses[i].dnses = alloca(4*6+4*6);
-        sprintf(propKey, "net.%s.dns1", PPP_TTY_PATH);
-        property_get(propKey, propValue, "8.8.8.8");
-        strcpy(responses[i].dnses, propValue);
-        strcat(responses[i].dnses, " ");
-        sprintf(propKey, "net.%s.dns2", PPP_TTY_PATH);
-        property_get(propKey, propValue, "8.8.4.4");
-        strcat(responses[i].dnses, propValue);
     }
 
     at_response_free(p_response);
 
-    propKey[0] = '\0';
-    sprintf(propKey, "net.%s.gw", PPP_TTY_PATH);
-    if (property_get(propKey, propValue, NULL) <= 0) {
-        sprintf(propKey, "net.%s.remote-ip", PPP_TTY_PATH);
+    responses[0].ifname = (char *)PPP_TTY_PATH;
+
+    get_local_ip(address);
+    responses[0].addresses = address;
+
+    if (responses[0].active == 1 && strcmp(address, "0.0.0.0")) {
+        responses[0].dnses = dnses;
+        sprintf(propKey, "net.%s.dns1", PPP_TTY_PATH);
         if (property_get(propKey, propValue, NULL) <= 0) {
-            sprintf(propKey, "net.%s.gw", "gprs");
+            sprintf(propKey, "net.%s.dns1", "gprs");
+            property_get(propKey, propValue, "8.8.8.8");
+        }
+        strcpy(responses[0].dnses, propValue);
+        strcat(responses[0].dnses, " ");
+        sprintf(propKey, "net.%s.dns2", PPP_TTY_PATH);
+        if (property_get(propKey, propValue, NULL) <= 0) {
+            sprintf(propKey, "net.%s.dns2", "gprs");
+            property_get(propKey, propValue, "8.8.4.4");
+        }
+        strcat(responses[0].dnses, propValue);
+
+        responses[0].gateways = gateways;
+        sprintf(propKey, "net.%s.gw", PPP_TTY_PATH);
+        if (property_get(propKey, propValue, NULL) <= 0) {
+            sprintf(propKey, "net.%s.remote-ip", PPP_TTY_PATH);
             if (property_get(propKey, propValue, NULL) <= 0) {
-                sprintf(propKey, "net.%s.remote-ip", "gprs");
-                property_get(propKey, propValue, responses[i].addresses); //quectel, gateways is no mean for wwan
+                sprintf(propKey, "net.%s.gw", "gprs");
+                if (property_get(propKey, propValue, NULL) <= 0) {
+                    sprintf(propKey, "net.%s.remote-ip", "gprs");
+                    property_get(propKey, propValue, "0.0.0.0"); //quectel, gateways is no mean for wwan
+                }
             }
         }
+        strcpy(responses[0].gateways, propValue);
+
+        LOGD("addresses: %s", responses[0].addresses);
+        LOGD("dnses: %s", responses[0].dnses);
+        LOGD("gateways: %s", responses[0].gateways);
+   } else {
+        responses[0].active = 0;
+        responses[0].status= -1;
+   }
+
+    if (t != NULL) {
+        int responses_len = sizeof(RIL_Data_Call_Response_v6);
+#if RIL_VERSION >= 11
+        if (s_callbacks.version >= 11) {
+            ((RIL_Data_Call_Response_v9 *)responses)->pcscf = 0;
+            responses_len = sizeof(RIL_Data_Call_Response_v9);
+        }
+#endif
+        RIL_onRequestComplete(*t, RIL_E_SUCCESS, responses, responses_len);
     }
-    responses[i].gateways = strdup(propValue);
-
-    LOGD("type: %s", responses[i].type);
-    LOGD("ifname: %s", responses[i].ifname);
-    LOGD("addresses: %s", responses[i].addresses);
-    LOGD("dnses: %s", responses[i].dnses);
-    LOGD("gateways: %s", responses[i].gateways);
-
-    if (t != NULL)
-        RIL_onRequestComplete(*t, RIL_E_SUCCESS, responses,
-                              n * sizeof(RIL_Data_Call_Response_v6));
     else
         RIL_onUnsolicitedResponse(RIL_UNSOL_DATA_CALL_LIST_CHANGED,
-                                  responses,
-                                  n * sizeof(RIL_Data_Call_Response_v6));
+                                  NULL, 0);
 
     return;
 
@@ -839,7 +987,7 @@ static void requestGetCurrentCalls(void *data, size_t datalen, RIL_Token t)
 
     if (err != 0 || p_response->success == 0) {
         LOGE("%s response generic failure", __func__);
-        RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+        RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
         return;
     }
 
@@ -884,7 +1032,7 @@ static void requestGetCurrentCalls(void *data, size_t datalen, RIL_Token t)
     }
 
     LOGI("Calls=%d,Valid=%d",countCalls,countValidCalls);
-    
+
     RIL_onRequestComplete(t, RIL_E_SUCCESS, pp_calls,
             countValidCalls * sizeof (RIL_Call *));
 
@@ -988,16 +1136,26 @@ static void requestSignalStrength(void *data, size_t datalen, RIL_Token t)
     int err;
     int response[2];
     char *line;
+    int cdma_rssi;
+    int lte_rssi = 0;
+    int lte_rsrp = 0;
+    int lte_sinr = 0;
+    int lte_rsrq = 0;
+
+    int cops_response[4] = {0};
+    RIL_SignalStrength_v6 signalStrength;
+    memset(&signalStrength, 0, sizeof(RIL_SignalStrength_v6));
+
+#define CDMA_RSSI_THRESH	125
+#define CDMA_RSSI_SPAN		(CDMA_RSSI_THRESH - 75)
 
     if (s_closed && (currentState() == RADIO_STATE_SIM_READY)) {
-        RIL_SignalStrength_v6 signalStrength;
-        memset(&signalStrength, 0, sizeof(RIL_SignalStrength_v6));
         /**
         *  In Android Jelly Bean, the invalid value for
         *  LET signalStrength should be 99 depending on the SignalStrength.java.
         */
         //#if ((PLATFORM_VERSION >= 420) || ((PLATFORM_VERSION < 100) && (PLATFORM_VERSION >= 42)))
-        if (RIL_VERSION >= 7) {
+        if (QL_RIL_VERSION >= 7) {
             signalStrength.LTE_SignalStrength.signalStrength = 99;
             signalStrength.LTE_SignalStrength.rsrp = 0x7FFFFFFF;
             signalStrength.LTE_SignalStrength.rsrq = 0x7FFFFFFF;
@@ -1012,6 +1170,11 @@ static void requestSignalStrength(void *data, size_t datalen, RIL_Token t)
         }	
         signalStrength.GW_SignalStrength.signalStrength = 31;
         signalStrength.GW_SignalStrength.bitErrorRate = 0;
+        signalStrength.CDMA_SignalStrength.dbm = 75;
+        signalStrength.CDMA_SignalStrength.ecio = 90;
+        signalStrength.EVDO_SignalStrength.dbm = 65;
+        signalStrength.EVDO_SignalStrength.ecio = 90;
+        signalStrength.EVDO_SignalStrength.signalNoiseRatio = 8;
         RIL_onRequestComplete(t, RIL_E_SUCCESS, &signalStrength, sizeof(RIL_SignalStrength_v6));
         return;
     }
@@ -1036,28 +1199,89 @@ static void requestSignalStrength(void *data, size_t datalen, RIL_Token t)
 
 #if 1 //quectel
 {
-    RIL_SignalStrength_v6 signalStrength;
-    memset(&signalStrength, 0, sizeof(RIL_SignalStrength_v6));
     /**
      *  In Android Jelly Bean, the invalid value for
      *  LET signalStrength should be 99 depending on the SignalStrength.java.
      */
 //#if ((PLATFORM_VERSION >= 420) || ((PLATFORM_VERSION < 100) && (PLATFORM_VERSION >= 42)))
-if (RIL_VERSION >= 7) {
-    signalStrength.LTE_SignalStrength.signalStrength = 99;
-    signalStrength.LTE_SignalStrength.rsrp = 0x7FFFFFFF;
-    signalStrength.LTE_SignalStrength.rsrq = 0x7FFFFFFF;
-    signalStrength.LTE_SignalStrength.rssnr = 0x7FFFFFFF;
-    signalStrength.LTE_SignalStrength.cqi = 0x7FFFFFFF;
-} else {
-    signalStrength.LTE_SignalStrength.signalStrength = -1;
-    signalStrength.LTE_SignalStrength.rsrp = -1;
-    signalStrength.LTE_SignalStrength.rsrq = -1;
-    signalStrength.LTE_SignalStrength.rssnr = -1;
-    signalStrength.LTE_SignalStrength.cqi = -1;
-}	
+    if (QL_RIL_VERSION >= 7) {
+        signalStrength.LTE_SignalStrength.signalStrength = 99;
+        signalStrength.LTE_SignalStrength.rsrp = 0x7FFFFFFF;
+        signalStrength.LTE_SignalStrength.rsrq = 0x7FFFFFFF;
+        signalStrength.LTE_SignalStrength.rssnr = 0x7FFFFFFF;
+        signalStrength.LTE_SignalStrength.cqi = 0x7FFFFFFF;
+    } else {
+        signalStrength.LTE_SignalStrength.signalStrength = -1;
+        signalStrength.LTE_SignalStrength.rsrp = -1;
+        signalStrength.LTE_SignalStrength.rsrq = -1;
+        signalStrength.LTE_SignalStrength.rssnr = -1;
+        signalStrength.LTE_SignalStrength.cqi = -1;
+    }
+
     signalStrength.GW_SignalStrength.signalStrength = response[0];
     signalStrength.GW_SignalStrength.bitErrorRate = response[1];
+
+    /**
+     *	Fill the cdma rssi value here. When we fill the actual rssi with 75, the
+     *  SignalStrength.java will deal with it as -75
+     */
+    cdma_rssi = CDMA_RSSI_THRESH - ((response[0] * CDMA_RSSI_SPAN) / 31); // Change it following the modem code.
+
+    signalStrength.CDMA_SignalStrength.dbm = cdma_rssi;
+    signalStrength.CDMA_SignalStrength.ecio = cdma_rssi;
+    signalStrength.EVDO_SignalStrength.dbm = cdma_rssi;
+    signalStrength.EVDO_SignalStrength.ecio = cdma_rssi;
+#if 1
+    quectel_at_cops(cops_response);
+    if (cops_response[3] == 7) { //lte mode
+        lte_rssi = signalStrength.LTE_SignalStrength.signalStrength = (response[0] <= 31) ? response[0]*63/31 : response[0];
+        lte_rsrp = 140 - lte_rssi;
+        signalStrength.LTE_SignalStrength.rsrp = lte_rsrp;
+        at_response_free(p_response);
+        err = at_send_command_singleline("AT+QCSQ", "+QCSQ:", &p_response);
+        if ((0 == err) && p_response && (0 != p_response->success)) {
+            line = p_response->p_intermediates->line;
+            err = at_tok_start(&line);
+            if (err < 0) {
+                goto cqsq_err;
+            }
+            err = skipComma(&line);
+            if (err < 0) {
+                goto cqsq_err;
+            }
+            err = at_tok_nextint(&line, &lte_rssi);
+            if (err < 0) {
+                goto cqsq_err;
+            }
+            //signalStrength.LTE_SignalStrength.signalStrength = -lte_rssi;
+            err = at_tok_nextint(&line, &lte_rsrp);
+            if (err < 0) {
+                goto cqsq_err;
+            }
+            signalStrength.LTE_SignalStrength.rsrp = -lte_rsrp;
+            err = at_tok_nextint(&line, &lte_sinr);
+            if (err < 0) {
+                goto cqsq_err;
+            }
+            signalStrength.LTE_SignalStrength.rssnr = lte_sinr;
+
+            err = at_tok_nextint(&line, &lte_rsrq);
+            if (err < 0) {
+                goto cqsq_err;
+            }
+            signalStrength.LTE_SignalStrength.rsrq = -lte_rsrq;
+        }
+        signalStrength.GW_SignalStrength.signalStrength = -1;
+        signalStrength.GW_SignalStrength.bitErrorRate = -1;
+        signalStrength.CDMA_SignalStrength.dbm = -1;
+        signalStrength.CDMA_SignalStrength.ecio = -1;
+        signalStrength.EVDO_SignalStrength.dbm = -1;
+        signalStrength.EVDO_SignalStrength.ecio = -1;
+        signalStrength.EVDO_SignalStrength.signalNoiseRatio = -1;
+    }
+cqsq_err:
+#endif
+
     RIL_onRequestComplete(t, RIL_E_SUCCESS, &signalStrength, sizeof(RIL_SignalStrength_v6));
 }
 #else
@@ -1066,11 +1290,11 @@ if (RIL_VERSION >= 7) {
 
 #if 1 // some UG95 fireware donot report +CGREG/+CREG when network state change
     if (ql_is_UG95) {
-        static int old_response[4];
-        int new_response[4];
-        quectel_at_creg(new_response);
-        if (memcmp(new_response, old_response, sizeof(old_response))) {
-            memcpy(old_response, new_response, sizeof(old_response));
+        static int old_cgreg_response[4];
+        int new_cgreg_response[4];
+        quectel_at_cgreg(new_cgreg_response);
+        if (memcmp(new_cgreg_response, old_cgreg_response, sizeof(old_cgreg_response))) {
+            memcpy(old_cgreg_response, new_cgreg_response, sizeof(old_cgreg_response));
             RIL_onUnsolicitedResponse (RIL_UNSOL_RESPONSE_VOICE_NETWORK_STATE_CHANGED,NULL, 0);
         }
     }
@@ -1085,12 +1309,14 @@ error:
     at_response_free(p_response);
 }
 
+static int s_lastRegistrationState[4]; //stat, lac, ci, Act
+static int quectel_cimi = 0;
 static void requestRegistrationState(int request, void *data,
                                         size_t datalen, RIL_Token t)
 {
     int err;
-    int response[4];
-    char * responseStr[4];
+    int response[14] = {0, 0, 0, 0};
+    char * responseStr[14];
     ATResponse *p_response = NULL;
     const char *cmd;
     const char *prefix;
@@ -1098,7 +1324,10 @@ static void requestRegistrationState(int request, void *data,
     int commas;
     int skip;
     int count = 3;
+    int cops_response[4];
+    int i;
 
+    static int cdmaphone = 0;
 
     if (request == RIL_REQUEST_VOICE_REGISTRATION_STATE) {
         cmd = "AT+CREG?";
@@ -1167,6 +1396,18 @@ __requestRegistrationState_restart:
             response[1] = -1;
             response[2] = -1;
             if (err < 0) goto error;
+#if 1 //quectel
+            if (/*ql_is_UC20 &&*/ (request == RIL_REQUEST_DATA_REGISTRATION_STATE) && s_lastRegistrationState[3]) {
+                quectel_at_cops(cops_response);
+                if (cops_response[3]) {
+                    response[0] = s_lastRegistrationState[0];
+                    response[1] = s_lastRegistrationState[1];
+                    response[2] = s_lastRegistrationState[2];
+                    response[3] = cops_response[3];
+                    count = 4;
+                }
+            }
+#endif
         break;
 
         case 2: /* +CREG: <stat>, <lac>, <cid> */
@@ -1207,9 +1448,9 @@ __requestRegistrationState_restart:
             if (err < 0) goto error;
 #if 1 //quectel UC15&UC20&UG95 canot get raido tech from AT+CGREG?, what about EC20?
             if ((request == RIL_REQUEST_DATA_REGISTRATION_STATE) && (response[3] == 2)) {
-                int real_act = quectel_at_cops();
-                if (real_act > response[3])
-                    response[3] = real_act;
+                quectel_at_cops(cops_response);
+                if (cops_response[3] > response[3])
+                    response[3] = cops_response[3];
             }
 #endif
             count = 4;
@@ -1229,16 +1470,26 @@ __requestRegistrationState_restart:
     }
 #endif
 
-    asprintf(&responseStr[0], "%d", response[0]);
-    asprintf(&responseStr[1], "%x", response[1]);
-    asprintf(&responseStr[2], "%x", response[2]);
+#if 1 // For LTE mode, the response from +CREG
+#define LTE_MODE_FROM_COPS	7
+    if(ql_is_EC20 && (request == RIL_REQUEST_VOICE_REGISTRATION_STATE)
+	    && !currentDataServiceState() && (response[0] == 1 && response[1] == 65534) // 65534 equals 0xfffe, it's not a real lte lac 
+		&& !strcmp(cmd, "AT+CREG?"))
+    {
+        if(quectel_at_cops(cops_response) == LTE_MODE_FROM_COPS) {
+            cmd = "AT+CGREG?";
+            prefix = "+CGREG:";
+            goto __requestRegistrationState_restart;
+        }
+    }
+#endif
 
 #if 1 //quectel
     if (skip != 2) {
         at_response_free(p_response);
         p_response = NULL;
-        at_send_command("AT+CREG=2", NULL); 
-        at_send_command("AT+CGREG=2", NULL); 
+        at_send_command("AT+CREG=2", NULL);
+        at_send_command("AT+CGREG=2", NULL);
         goto __requestRegistrationState_restart;
     }
 
@@ -1250,13 +1501,16 @@ __requestRegistrationState_restart:
             if (!(err < 0  || p_response == NULL || p_response->success == 0)) {
                 //+QLTS: "13/08/23,06:51:13+32,0"
                 char *response;
-                char *line = strdup(p_response->p_intermediates->line);
-                at_tok_start(&line);
-                err = at_tok_nextstr(&line, &response);
+                char *line = p_response->p_intermediates->line;
+                err = at_tok_start(&line);
+                if (err == 0)
+                    err = at_tok_nextstr(&line, &response);
 
                 if (err != 0) {
                     LOGE("invalid QLTS line %s\n", p_response->p_intermediates->line);
                 } else {
+                    if (response[4] == '/') //2014 -> 14
+                        response += 2;
                     RIL_onUnsolicitedResponse (RIL_UNSOL_NITZ_TIME_RECEIVED, response, strlen(response));
                 }
             }
@@ -1264,7 +1518,7 @@ __requestRegistrationState_restart:
             time_zone_report = 1;
         }
     }
-    
+
     if (count == 3) {
         if ((response[1] == -1) && (response[2] == -1)) {
             //to advoid throw <java.lang.NumberFormatException: Invalid int: "ffffffff"> in GsmServiceStateTracker.java
@@ -1294,18 +1548,69 @@ __requestRegistrationState_restart:
                case 7: //LTE
                     radio_tech = RADIO_TECH_LTE;
                 break;
+                case 0x100:
+                    cdmaphone = 1;
+                    radio_tech= quectel_at_qnwinfo();
+                    if (s_lastRegistrationState[3] != 0x100) {
+                            char value[PROPERTY_VALUE_MAX];
+                            quectel_at_cops(cops_response);
+                            sprintf(value, "%d", cops_response[2]);
+                            if (cops_response[2] == 46003) //in fact, wo should not set this prop here!
+                                property_set("gsm.sim.operator.numeric", value);
+                    }
+                    //Add by Wythe.WANG for CDMA
+                    count = 14;
+                    response[4] = response[2] & 0x0000ffff;
+                    response[5] = 0;
+                    response[6] = 0;
+                    response[7] = 0;
+                    response[8] = response[1];
+                    response[9] = response[2] & 0xffff0000;
+                    response[10] = 0;
+                    response[11] = 0;
+                    response[12] = 0;
+                    response[13] = 0;
+                break;
                 default:
                     radio_tech = RADIO_TECH_UNKNOWN;
                 break;
         }
         response[3] = radio_tech;
     }
-#endif  
+#endif
 
-    if (count > 3)
-        asprintf(&responseStr[3], "%d", response[3]);
+    if (count > 3) {
+//GsmServiceStateTracker.java CdmaServiceStateTracker.java CdmaLteServiceStateTracker.java
+//handle EVENT_POLL_STATE_GPRS
+//for cmda, 5.1 always use EVENT_POLL_STATE_GPRS
+        if (cdmaphone)
+            count = 14;
+    }
 
-    RIL_onRequestComplete(t, RIL_E_SUCCESS, responseStr, count*sizeof(char*));
+    if (ql_is_UC20 && 5 == response[0] && 46006 == quectel_cimi) {//roaming
+        quectel_at_cops(cops_response);
+        LOGD("[%s:%d] quectel_cimi = %d, cops_rsp[2] = %d.\n", __func__, __LINE__, quectel_cimi, cops_response[2]);
+        if (46001 == cops_response[2]) {
+            response[0] = 1; 
+        }
+    }
+
+    if (request == RIL_REQUEST_DATA_REGISTRATION_STATE) {
+        s_lastRegistrationState[0] = response[0];
+        s_lastRegistrationState[1] = response[1];
+        s_lastRegistrationState[2] = response[2];
+        s_lastRegistrationState[3] = response[3];
+    }
+
+    for (i = 0; i < count; i++) {
+        if (i == 1 || i == 2)
+            asprintf(&responseStr[i], "%x",  response[i]);
+        else
+            asprintf(&responseStr[i], "%d",  response[i]);
+    }
+    RIL_onRequestComplete(t, RIL_E_SUCCESS, responseStr, count * sizeof(char *));
+    for (i = 0; i < count; i++)
+        free(responseStr[i]);
     at_response_free(p_response);
 
     return;
@@ -1385,7 +1690,7 @@ __requestOperator_restart:
         network_debounce_time--;
         at_response_free(p_response);
         goto __requestOperator_restart;
-    }     
+    }
     network_debounce_time = 0;
 #endif
 
@@ -1405,7 +1710,7 @@ static void requestSendSMS(void *data, size_t datalen, RIL_Token t)
     const char *smsc;
     const char *pdu;
     int tpLayerLength;
-    char *cmd1, *cmd2;
+    char *cmd1 = NULL, *cmd2 = NULL;
     RIL_SMS_Response response;
     ATResponse *p_response = NULL;
 
@@ -1423,12 +1728,91 @@ static void requestSendSMS(void *data, size_t datalen, RIL_Token t)
     asprintf(&cmd2, "%s%s", smsc, pdu);
 
     err = at_send_command_sms(cmd1, cmd2, "+CMGS:", &p_response);
+    free(cmd1);
+    free(cmd2);
 
     if (err != 0 || p_response->success == 0) goto error;
 
     memset(&response, 0, sizeof(response));
 
     /* FIXME fill in messageRef and ackPDU */
+
+    RIL_onRequestComplete(t, RIL_E_SUCCESS, &response, sizeof(response));
+    at_response_free(p_response);
+
+    return;
+error:
+    LOGE("%s error", __func__);
+    RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+    at_response_free(p_response);
+}
+
+typedef unsigned char uint8;
+#define ASSERT(__s) do {} while(0)
+#define QL_CDMASMS_TRACE(lvl, fmt,...) LOGD(fmt,##__VA_ARGS__)
+#include "ril_cdma_sms.c"
+
+static void requestSendCdmaSMS(void *data, size_t datalen, RIL_Token t)
+{
+    int err;
+    RIL_SMS_Response response;
+    ATResponse *p_response = NULL;
+    RIL_CDMA_SMS_Message rcsm;
+    char tmp[1024];
+    int i;
+    unsigned char *cdma_pdu;
+    unsigned short pdu_len;
+    char *cmd1 = NULL, *cmd2 = NULL;
+
+    memcpy(&rcsm, data, datalen);
+
+    LOGD("uTeleserviceID: %d", rcsm.uTeleserviceID);
+    LOGD("bIsServicePresent: %d", rcsm.bIsServicePresent);
+    LOGD("uServicecategory: %d", rcsm.uServicecategory);
+
+    LOGD("sAddress.digit_mode: %d", rcsm.sAddress.digit_mode);
+    LOGD("sAddress.number_mode: %d", rcsm.sAddress.number_mode);
+    LOGD("sAddress.number_type: %d", rcsm.sAddress.number_type);
+    LOGD("sAddress.number_plan: %d", rcsm.sAddress.number_plan);
+    LOGD("sAddress.number_of_digits: %d", rcsm.sAddress.number_of_digits);
+    for (i = 0; i < rcsm.sAddress.number_of_digits; i++)
+        sprintf(&tmp[i*3], "%02x ", rcsm.sAddress.digits[i]);
+    LOGD("sAddress.digits: %s", tmp);
+
+    LOGD("sSubAddress.subaddressType: %d", rcsm.sSubAddress.subaddressType);
+    LOGD("sSubAddress.odd: %d", rcsm.sSubAddress.odd);
+    LOGD("sSubAddress.number_of_digits: %d", rcsm.sSubAddress.number_of_digits);
+    for (i = 0; i < rcsm.sSubAddress.number_of_digits; i++)
+        sprintf(&tmp[i*3], "%02x ", rcsm.sSubAddress.digits[i]);
+    LOGD("sSubAddress.digits: %s", tmp);
+
+    LOGD("uBearerDataLen: %d", rcsm.uBearerDataLen);
+    for (i = 0; i < rcsm.uBearerDataLen; i++)
+        sprintf(&tmp[i*3], "%02x ", rcsm.aBearerData[i]);
+    LOGD("aBearerData: %s", tmp);
+
+    memset(&response, 0, sizeof(response));
+
+    /* FIXME fill in messageRef and ackPDU */
+
+    cdma_pdu = (unsigned char *)QL_RIL_CDMASMS_sEncodePDUP2P(1, data, &pdu_len);
+    if (cdma_pdu == NULL || pdu_len == 0)
+        goto error;
+    cdma_pdu[pdu_len] = 0;
+    for (i = 0; i < pdu_len; i++)
+        sprintf(&tmp[i*2], "%02x", cdma_pdu[i]);
+
+    asprintf(&cmd1, "AT+QSMSS=%d", pdu_len);
+    //asprintf(&cmd2, "%s", cdma_pdu);
+
+    err = at_send_command_sms(cmd1, tmp, "+QSMSS:", &p_response);
+    free(cmd1);
+    free(cmd2);
+
+    if (err != 0 || p_response->success == 0) goto error;
+
+    memset(&response, 0, sizeof(response));
+
 
     RIL_onRequestComplete(t, RIL_E_SUCCESS, &response, sizeof(response));
     at_response_free(p_response);
@@ -1452,6 +1836,21 @@ void requestSendSMSExpectMore(void *data, size_t datalen, RIL_Token t)
         requestSendSMS(data, datalen, t);
 }
 
+int notifyDataCallProcessExit(void) {
+#if 1 //(QL_RIL_VERSION > 9) //lollipop
+    if (bSetupDataCallCompelete) {
+        RIL_requestTimedCallback (onDataCallExit, NULL, NULL);        
+        bSetupDataCallCompelete = 0;
+        return 1;
+    } else {
+        nSetupDataCallFailTimes++;
+        if (nSetupDataCallFailTimes > 3)
+            return 1;
+    }
+#endif
+    return 0;
+}
+
 //update:Joe.Wang 2014-1-13
 static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
 {
@@ -1460,6 +1859,9 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
     const char *pass = NULL;
     const char *auth_type = NULL;
     const char *pdp_type = "IP";
+    char ppp_number[20] = {'\0'};
+    int cgreg_response[4];
+    int cops_response[4];
     char *cmd;
     int err;
     int retry = 0;
@@ -1469,7 +1871,7 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
     char ppp_local_ip[PROPERTY_VALUE_MAX] = {'\0'};
     struct timeval begin_tv, end_tv;
     gettimeofday(&begin_tv, NULL);
-    
+
     apn = ((const char **)data)[2];
     if (datalen > 3 * sizeof(char *))
         user = ((char **)data)[3];
@@ -1487,26 +1889,77 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
     LOGI("pdp_type:%s",pdp_type);
     LOGI("*************************************");
 
-#if 1 // quectel Set DTR Function Mode 
+#if 1 // quectel Set DTR Function Mode
 //ON->OFF on DTR: Disconnect data call, change to command mode. During state DTR = OFF, auto-answer function is disabled
     at_send_command("AT&D2", NULL);
 #endif
+#ifdef USB_HOST_USE_RESET_RESUME
+    if (ql_is_UC20 || ql_is_EC20)
+        at_send_command("AT&D0", NULL);
+#endif
 
+    bSetupDataCallCompelete = 0;
+    nSetupDataCallFailTimes = 0;
      //Make sure there is no existing connection or pppd instance running
     if (!strncmp(PPP_TTY_PATH, "ppp", 3))
-        ql_pppd_stop(SIGKILL);
+        ql_pppd_stop(SIGTERM);
     else
-        ql_ndis_stop(SIGKILL);
-    
-    if (currentDataServiceState() == 0) {
+        ql_ndis_stop(SIGTERM);
+
+    if (isRadioOn() != 1) {
+        LOGE("raido is off!");
+        goto error;
+    }
+
+    quectel_at_cgreg(cgreg_response);
+    quectel_at_cops(cops_response);
+
+    if (cgreg_response[0] != 1 && cgreg_response[0] != 5) {
+        if (ql_is_EC20) {
+            if (cops_response[3] == 7) { //lte moe
+                at_send_command("AT+CGDCONT=1,\"IPV4V6\",\"\"",  NULL);
+                at_send_command("AT+CGATT=0",  NULL);
+                at_send_command("AT+CGATT=1",  NULL);
+           }
+        }
+        if (ql_is_UC20) {
+            if (cops_response[3] == 6) {
+                at_send_command("AT+CFUN=4",  NULL);
+                sleep(3);
+                at_send_command("AT+CFUN=1",  NULL);
+           }
+        }
         RIL_onUnsolicitedResponse (RIL_UNSOL_RESPONSE_VOICE_NETWORK_STATE_CHANGED, NULL, 0);
         LOGE("gprsState is out of service!");
         goto error;
     }
+
+//this informations should set by user, it is not a good idea to fix here
+    if ((cgreg_response[3] == 0x100) || (cops_response[3] == 100)) { //cdma
+        if (!user || !user[0])
+            user = "ctnet@mycdma.cn";
+        if (!pass || !pass[0])
+            pass="vnet.mobi";
+        if (!ppp_number[0])
+            strcpy(ppp_number, "#777");
+        if (!auth_type || auth_type[0] == '0')
+            auth_type = "2"; //chap
+
+        asprintf(&cmd, "at+qctpwdcfg=\"%s\",\"%s\"", user, pass);
+        err = at_send_command(cmd, NULL);
+        free(cmd);
+    }
+
+    s_default_pdp = 1;
+    if (cops_response[3] == 7) //lte moe
+        s_default_pdp = CONFIG_DEFAULT_PDP;
     
+    if (!ppp_number[0])
+        snprintf(ppp_number, sizeof(ppp_number), "*99***%d#", s_default_pdp);
+
     LOGD("requesting data connection to APN '%s'!\n", apn);
-     
-    asprintf(&cmd, "AT+CGDCONT=1,\"%s\",\"%s\"", pdp_type, apn);
+
+    asprintf(&cmd, "AT+CGDCONT=%d,\"%s\",\"%s\"", s_default_pdp, pdp_type, apn);
 
     //FIXME check for error here
     err = at_send_command(cmd, NULL);
@@ -1515,21 +1968,21 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
     PPP_TTY_PATH = "ppp0";
     /* start the gprs pppd */
     if (ql_mux_enabled)
-        ql_pppd_pid = ql_pppd_start(CMUX_PPP_PORT, user, pass, auth_type);
+        ql_pppd_pid = ql_pppd_start(CMUX_PPP_PORT, user, pass, auth_type, ppp_number);
     else {
         char *usbnet_adapeter = NULL;
-        if ((ql_is_UC20 || ql_is_EC20) && !access("/system/bin/quectel-CM", X_OK) && !ql_get_ndisname(&usbnet_adapeter) && usbnet_adapeter) {
+        if ((ql_is_UC20 || ql_is_EC20 || ql_is_XX("EC25") || ql_is_XX("EC21")) && !ql_get_ndisname(&usbnet_adapeter) && usbnet_adapeter) {
             PPP_TTY_PATH = usbnet_adapeter;
-            ql_pppd_pid = ql_ndis_start(apn, user, pass, auth_type);
+            ql_pppd_pid = ql_ndis_start(apn, user, pass, auth_type, s_default_pdp);
         } else {
-            ql_pppd_pid = ql_pppd_start(NULL, user, pass, auth_type);
+            ql_pppd_pid = ql_pppd_start(NULL, user, pass, auth_type, ppp_number);
         }
     }
     if (ql_pppd_pid < 0)
         goto error;
 
-    sleep(3);
-    while (!s_closed && (retry++ < 50)) {
+    sleep(1);
+    while (!s_closed && (retry++ < 50) && (nSetupDataCallFailTimes <= 3)) {
         if ((waitpid(ql_pppd_pid, NULL, WNOHANG)) == ql_pppd_pid)
             goto error;
         get_local_ip(ppp_local_ip);
@@ -1540,23 +1993,21 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
     }
     gettimeofday(&end_tv, NULL);
     LOGD("get_local_ip: %s, cost %ld sec", ppp_local_ip, (end_tv.tv_sec - begin_tv.tv_sec));
-    if(strlen(ppp_local_ip) <= 6)
+    if (!strcmp(ppp_local_ip, "0.0.0.0"))
         goto error;
 
     requestOrSendDataCallList(&t);
     at_response_free(p_response);
 
-#if 1 // quectel Set DTR Function Mode 
-    if (USB_HOST_SUSPEND_SUPPORT == 0) //if the usb host donot support suspend
-        at_send_command("AT&D0", NULL); //TA ignores status on DTR, will donot disconnect ppp when DTR is assert
-#endif
+    bSetupDataCallCompelete = 1;
+    nSetupDataCallFailTimes = 0;
     return;
 
 error:
     if (!strncmp(PPP_TTY_PATH, "ppp", 3))
-        ql_pppd_stop(SIGKILL);
+        ql_pppd_stop(SIGTERM);
     else
-        ql_ndis_stop(SIGKILL);
+        ql_ndis_stop(SIGTERM);
     LOGE("Unable to setup PDP in %s\n", __func__);
     RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
     at_response_free(p_response);
@@ -1641,8 +2092,14 @@ static TLV * getTLV(const unsigned char *d, unsigned char tag) {
 
 //frameworks\base\telephony\java\com\android\internal\telephony\IccFileHandler.java
 //from TS 11.11 9.1 or elsewhere
+const int EF_ICCID  = 0x2fe2;
+const int COMMAND_READ_BINARY = 0xb0;
+const int COMMAND_UPDATE_BINARY = 0xd6;
+const int COMMAND_READ_RECORD = 0xb2;
+const int COMMAND_UPDATE_RECORD = 0xdc;
+const int COMMAND_SEEK = 0xa2;
 const int COMMAND_GET_RESPONSE = 0xc0;
-
+        
 //***** types of files  TS 11.11 9.3
 static const int EF_TYPE_TRANSPARENT = 0;
 static const int EF_TYPE_LINEAR_FIXED = 1;
@@ -1688,9 +2145,9 @@ void usim2sim(RIL_SIM_IO_Response *psr) {
 
     if (!strlen(psr->simResponse)) {
         psr->simResponse = NULL;
-        return;    
+        return;
     }
-    
+
     if (strlen(psr->simResponse) < 4)
         return;
 
@@ -1711,7 +2168,7 @@ void usim2sim(RIL_SIM_IO_Response *psr) {
         //LOGD("CRSM: FILE_SIZE %02X%02X", tlv->data[0], tlv->data[1]);
         sim_data[RESPONSE_DATA_FILE_SIZE_1] = tlv->data[0];
         sim_data[RESPONSE_DATA_FILE_SIZE_2] = tlv->data[1];
-    }   
+    }
 
     tlv = getTLV(usim_data, 0x83);
     if (tlv) {
@@ -1725,7 +2182,7 @@ void usim2sim(RIL_SIM_IO_Response *psr) {
         int filetype = (tlv->data[0] >> 3) & 0x7;
         int efstruct = (tlv->data[0] >> 0) & 0x7;
         //LOGD("CRSM: len: %d, %02x %02x %02x %02x %02x", tlv->len, tlv->data[0], tlv->data[1], tlv->data[2], tlv->data[3], tlv->data[4]);
-        
+
         //File type:
         if ((filetype == 0) || (filetype == 1)) {
             //LOGD("CRSM: FILE_TYPE_EF");
@@ -1747,7 +2204,7 @@ void usim2sim(RIL_SIM_IO_Response *psr) {
             sim_data[RESPONSE_DATA_STRUCTURE] = EF_TYPE_LINEAR_FIXED;
         } else if (efstruct == 3) {
             //LOGD("CRSM: EF_TYPE_CYCLIC");
-            sim_data[RESPONSE_DATA_STRUCTURE] = EF_TYPE_CYCLIC;    
+            sim_data[RESPONSE_DATA_STRUCTURE] = EF_TYPE_CYCLIC;
          } else {
             //LOGD("CRSM: EF_TYPE_UNKNOWN");
          }
@@ -1755,7 +2212,7 @@ void usim2sim(RIL_SIM_IO_Response *psr) {
         if ((efstruct == 2) || (efstruct == 3)) {
             if (tlv->len == 5) {
                 sim_data[RESPONSE_DATA_RECORD_LENGTH] = ((tlv->data[2] << 8) + tlv->data[3]) & 0xFF;
-               //LOGD("CRSM: RESPONSE_DATA_RECORD_LENGTH %d", sim_data[RESPONSE_DATA_RECORD_LENGTH]); 
+               //LOGD("CRSM: RESPONSE_DATA_RECORD_LENGTH %d", sim_data[RESPONSE_DATA_RECORD_LENGTH]);
             } else {
                 //LOGD("CRSM: must contain Record length and Number of records");
             }
@@ -1798,11 +2255,14 @@ static void  requestSIM_IO(void *data, size_t datalen, RIL_Token t)
     char *cmd = NULL;
     RIL_SIM_IO_v6 *p_args;
     char *line;
+	int i = 0;
+	ATResponse *qccid_response = NULL;
+	char iccid_low = 0;
 
     memset(&sr, 0, sizeof(sr));
 
     p_args = (RIL_SIM_IO_v6 *)data;
-    
+
     /* FIXME handle pin2 */
 #if 1 //quectel
     if (p_args->command == COMMAND_GET_RESPONSE) {
@@ -1811,7 +2271,7 @@ static void  requestSIM_IO(void *data, size_t datalen, RIL_Token t)
 #endif
 
     if (p_args->data == NULL) {
-        LOGI("[%s]: p_args->data is NULL\r\n", __func__);
+        LOGI("[%s]: p_args->data is NULL", __func__);
         asprintf(&cmd, "AT+CRSM=%d,%d,%d,%d,%d",
                     p_args->command, p_args->fileid,
                     p_args->p1, p_args->p2, p_args->p3);
@@ -1824,11 +2284,10 @@ static void  requestSIM_IO(void *data, size_t datalen, RIL_Token t)
                     p_args->command, p_args->fileid,
                     p_args->p1, p_args->p2, p_args->p3, p_args->data);
     }
-    
+
     err = at_send_command_singleline(cmd, "+CRSM:", &p_response);
 
     if (err < 0 || p_response->success == 0) {
-        LOGI("[%s]: send +CRSM error\r\n", __func__);
         goto error;
     }
 
@@ -1854,8 +2313,11 @@ static void  requestSIM_IO(void *data, size_t datalen, RIL_Token t)
         usim2sim(&sr);
 #endif
 
-    LOGD("[%s]: RIL_SIM_IO_Response Complete sr.sw1=%d, sr.sw2=%d, sr.simResponse=%s\r\n",
+    LOGD("[%s]: RIL_SIM_IO_Response Complete sr.sw1=%d, sr.sw2=%d, sr.simResponse=%s",
         __func__, sr.sw1, sr.sw2, sr.simResponse);
+
+    if (p_args->fileid == EF_ICCID && sr.simResponse == NULL)
+        goto error;
     
     RIL_onRequestComplete(t, RIL_E_SUCCESS, &sr, sizeof(sr));
     at_response_free(p_response);
@@ -1863,11 +2325,54 @@ static void  requestSIM_IO(void *data, size_t datalen, RIL_Token t)
 
     return;
 error:
+    if (p_args->fileid == EF_ICCID/* && ql_is_EC20 && strStartsWith(ql_product_version, "EC20CE")*/) {
+        sr.sw1 = 144;
+        sr.sw2 = 0;
+        sr.simResponse = NULL;
+        if (p_args->command == COMMAND_GET_RESPONSE) {
+            sr.simResponse = "0000000a2fe2040000000000000000";
+        } else if (p_args->command == COMMAND_READ_BINARY) {
+#define TELCOMM_DUMMY_ICCID "98681031098310024233"
+            err = at_send_command_singleline(cmd, "+QCCID:", &qccid_response);
+            if (err < 0 || qccid_response == NULL || qccid_response->success == 0) {
+                sr.simResponse = TELCOMM_DUMMY_ICCID;
+            } else {
+		    line = qccid_response->p_intermediates->line;
+		    if (0 == at_tok_start(&line) && 0 == at_tok_nextstr(&line, &sr.simResponse)) {
+			    for (i = 0; i < strlen(sr.simResponse); i+=2) {
+				    if ((strlen(sr.simResponse) - 1) < (i+1)) {
+					    LOGE("[%s:%d] array out of index, invalid iccid length.\n", __func__, __LINE__);
+					    sr.simResponse = TELCOMM_DUMMY_ICCID;
+				    } else {
+					    iccid_low = sr.simResponse[i];
+					    sr.simResponse[i] = sr.simResponse[i+1];
+					    sr.simResponse[i+1] = iccid_low;
+				    }
+			    }
+		    } else {
+			    LOGE("[%s:%d] at_tok_start or at_tok_nextstr failed.\n", __func__, __LINE__);
+			    sr.simResponse = TELCOMM_DUMMY_ICCID;
+		    }
+            }
+        }
+        if (sr.simResponse != NULL) {
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, &sr, sizeof(sr));
+            at_response_free(p_response);
+            free(cmd);
+			if (NULL != qccid_response) {
+				at_response_free(qccid_response);
+				qccid_response = NULL;
+			}
+            return;
+        }
+    }
     LOGE("%s error\n", __func__);
     RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
     at_response_free(p_response);
     free(cmd);
-
+    if (NULL != qccid_response) {
+        at_response_free(qccid_response);
+    }
 }
 
 static int getRemainingTimes(int request)
@@ -1878,7 +2383,7 @@ static int getRemainingTimes(int request)
     int err;
     //int n = 0;
     char *fac = NULL;
-    int pin1_remaining_times; 
+    int pin1_remaining_times;
     int puk1_remaining_times;
     int pin2_remaining_times;
     int puk2_remaining_times;
@@ -1889,8 +2394,8 @@ static int getRemainingTimes(int request)
     //    n++;
 
     if(err < 0  || p_response == NULL || p_response->success == 0) goto error;
-    
-    for (p_cur = p_response->p_intermediates; p_cur != NULL;p_cur = p_cur->p_next) 
+
+    for (p_cur = p_response->p_intermediates; p_cur != NULL;p_cur = p_cur->p_next)
     {
         char *line = p_cur->line;
 
@@ -1922,9 +2427,9 @@ static int getRemainingTimes(int request)
     free(p_cur);
 #if 0
     if(!strcmp(pinType,"PIN1")) return pin1_remaining_times;
-    else  if(!strcmp(pinType,"PIN2")) return pin2_remaining_times; 
-    else  if(!strcmp(pinType,"PUK1")) return puk1_remaining_times; 
-    else  if(!strcmp(pinType,"PUK2")) return puk2_remaining_times; 
+    else  if(!strcmp(pinType,"PIN2")) return pin2_remaining_times;
+    else  if(!strcmp(pinType,"PUK1")) return puk1_remaining_times;
+    else  if(!strcmp(pinType,"PUK2")) return puk2_remaining_times;
     else return -1;
 #else
     switch(request)
@@ -2058,7 +2563,7 @@ static void  requestSetFacility(void*  data, size_t  datalen, RIL_Token  t,int r
             break;
         }
     }
-    
+
     remaining_times = getRemainingTimes(request);
     LOGI("remaining_times = %d",remaining_times);
     RIL_onRequestComplete(t, errorril, &remaining_times, sizeof(int *));
@@ -2081,7 +2586,7 @@ static void  requestChangeSimPin(void*  data, size_t  datalen, char *fac, RIL_To
     err = at_send_command(cmd,&p_response);
     free(cmd);
     //if(err < 0 || p_response == NULL || p_response->success == 0) goto error;
-    
+
     remaining_times = getRemainingTimes(request);
     LOGI("remaining_times = %d",remaining_times);
     //RIL_onRequestComplete(t, RIL_E_SUCCESS, &remaining_times, sizeof(int *));
@@ -2128,7 +2633,7 @@ static void  requestEnterSimPin(void*  data, size_t  datalen, RIL_Token  t,int r
         }
     } else {
     RIL_onRequestComplete(t, RIL_E_SUCCESS, &remaining_times, sizeof(int *));
-    }    
+    }
 }
 
 static void  requestSendUSSD(void *data, size_t datalen, RIL_Token t)
@@ -2153,8 +2658,8 @@ static void  requestSendUSSD(void *data, size_t datalen, RIL_Token t)
     mode = 1;
 //    dcs = 15;
 
-    //asprintf(&cmd,"AT+CUSD=%d,%s,%d",mode,ussdRequest,dcs);                                                                                              
-    asprintf(&cmd,"AT+CUSD=%d,\"%s\"",mode,ussdRequest);                                                                                              
+    //asprintf(&cmd,"AT+CUSD=%d,%s,%d",mode,ussdRequest,dcs);
+    asprintf(&cmd,"AT+CUSD=%d,\"%s\"",mode,ussdRequest);
     err = at_send_command(cmd,&p_response);
     if(err != 0 || p_response == NULL || p_response->success == 0)
     {
@@ -2163,7 +2668,7 @@ static void  requestSendUSSD(void *data, size_t datalen, RIL_Token t)
 
 #if 1 //quectel
     ussd_pending_index++;
-    RIL_requestTimedCallback(onUssdTimedCallback, (void *)ussd_pending_index, &ussd_timeout_timeval);
+    RIL_requestTimedCallback(onUssdTimedCallback, (void *)(&ussd_pending_index), &ussd_timeout_timeval);
 #endif
     RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
     return;
@@ -2187,8 +2692,8 @@ error:
 */
 static void requestScreenState(void *data, size_t datalen, RIL_Token t)
 {
-#if 1 //quectel
-    if ((USB_HOST_SUSPEND_SUPPORT == 0) && (ql_is_UC20)) { //if the usb host donot support suspend
+#ifdef USB_HOST_USE_RESET_RESUME //quectel
+    if (ql_is_UC20) { //if the usb host donot support suspend
         if (((int *)data)[0]) {
             at_send_command("AT+QCFG=\"urc/ri/smsincoming\",\"pulse\",120", NULL);
             at_send_command("AT+QCFG=\"urc/delay\",0", NULL);
@@ -2198,16 +2703,15 @@ static void requestScreenState(void *data, size_t datalen, RIL_Token t)
         }
     }
 #endif
-	if (((int *)data)[0]) {
-		LOGE("exit sleep.....\n");
-		at_send_command("AT+CREG=2", NULL);
-		at_send_command("AT+CGREG=2", NULL);
-	}else {
-		LOGE("entry sleep ....\n");
-		at_send_command("AT+QSCLK=1", NULL);
-		at_send_command("AT+CREG=0", NULL);
-		at_send_command("AT+CGREG=0", NULL);
-	}
+
+    if (ql_is_EC20 && (!(((int *)data)[0])))
+        at_send_command("AT+QSCLK=1", NULL); //Configure Whether or not to Enter into Sleep Mode
+
+    //Add by Wythe.WANG for XingWang test 2016/1/20
+    //Use AT^DATAMODE here to check whether the ppp linker is still alive on modem side
+    if(ql_is_EC20 && (((int *)data)[0]) && !strcmp(PPP_TTY_PATH, "ppp0") && !access("/sys/class/net/ppp0", R_OK))
+        quectel_at_datamode();
+
     RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
 }
 
@@ -2233,13 +2737,13 @@ static void requestBaseBandVersion(void *data, size_t datalen, RIL_Token t)
     line = atResponse->p_intermediates->line;
 
     RIL_onRequestComplete(t, RIL_E_SUCCESS, line, sizeof(char *));
-    
+
     at_response_free(atResponse);
 }
 
 
 /*
-*   Function: requestGetIMEISV 
+*   Function: requestGetIMEISV
 *   Purpose : return the IMEI SV(software version)
 *   Request : RIL_REQUEST_GET_IMEISV
 */
@@ -2254,15 +2758,45 @@ static void requestGetIMEISV(RIL_Token t)
  *  Purpose : Requests to set the preferred network type for searching and registering
  *            (CS/PS domain, RAT, and operation mode).
  *  Request : RIL_REQUEST_SET_PREFERRED_NETWORK_TYPE
- */ 
+ */
 static void requestSetPreferredNetworkType(void *data, size_t datalen, RIL_Token t)
 {
     int rat,err;
-    const char* nwscanmode;
-    const char* nwscanseq = "AT+QCFG=\"nwscanseq\",0"; /* AUTO */
-	
+    int nwscanmode = 0; /* AUTO */
+    char *cmd;
+    const char * NetworkTypeStr[] = {
+        "PREF_NET_TYPE_GSM_WCDMA",
+        "PREF_NET_TYPE_GSM_ONLY",
+        "PREF_NET_TYPE_WCDMA_ONLY",
+        "PREF_NET_TYPE_GSM_WCDMA_AUTO",
+        "PREF_NET_TYPE_CDMA_EVDO_AUTO",
+        "PREF_NET_TYPE_CDMA_ONLY",
+        "PREF_NET_TYPE_EVDO_ONLY",
+        "PREF_NET_TYPE_GSM_WCDMA_CDMA_EVDO_AUTO",
+        "PREF_NET_TYPE_LTE_CDMA_EVDO",
+        "PREF_NET_TYPE_LTE_GSM_WCDMA",
+        "PREF_NET_TYPE_LTE_CMDA_EVDO_GSM_WCDMA",
+        "PREF_NET_TYPE_LTE_ONLY",
+        "PREF_NET_TYPE_LTE_WCDMA",
+        "PREF_NET_TYPE_UNKNOW",
+        "PREF_NET_TYPE_UNKNOW",
+        "PREF_NET_TYPE_UNKNOW",
+        "PREF_NET_TYPE_UNKNOW",
+        "PREF_NET_TYPE_UNKNOW",
+     };
+    ATResponse *atResponse = NULL;
+    char *line = NULL;
+    int cur_scanmode = 0;
+    char *default_scanseq = NULL;
+    char *cur_scanseq = NULL;
+    int scanmode_set = 1;
+    int scanseq_set = 1;
+
     assert (datalen >= sizeof(int *));
     rat = ((int *)data)[0];
+    s_lastPreferredNetworkType = rat;
+    if ((unsigned)rat < (sizeof(NetworkTypeStr) / sizeof(NetworkTypeStr[0])))
+        LOGD("%s %s", __func__, NetworkTypeStr[rat]);
 
     if (ql_is_GSM) { /* For 2G module, it only work in GSM */
         RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
@@ -2271,33 +2805,125 @@ static void requestSetPreferredNetworkType(void *data, size_t datalen, RIL_Token
 
     switch (rat) {
         case PREF_NET_TYPE_GSM_ONLY:    /* GSM ONLY*/
-            nwscanmode = "AT+QCFG=\"nwscanmode\",1";
+            nwscanmode = 1;
         break;
         case PREF_NET_TYPE_WCDMA: /* WCDMA ONLY*/
-            nwscanmode = "AT+QCFG=\"nwscanmode\",2";
+            nwscanmode = 2;
         break;
         case PREF_NET_TYPE_GSM_WCDMA: /* GSM/WCDMA (WCDMA preferred) */
         default:
-            nwscanmode = "AT+QCFG=\"nwscanmode\",0";
-            nwscanseq = "AT+QCFG=\"nwscanseq\",2"; /* WCDMA prior to GSM */
-        break; 
+            nwscanmode = 0;
+        break;
     }
 
-    err = at_send_command(nwscanseq, NULL);
-    if (err != 0) 
-        goto error;
-    err = at_send_command(nwscanmode, NULL);
-    if (err != 0) 
-        goto error;
+    if (ql_is_EC20) { //4G modules
+//RILConstants.java (frameworks\base\telephony\java\com\android\internal\telephony)
+//int PREFERRED_NETWORK_MODE      = NETWORK_MODE_WCDMA_PREF;
+//must change to NETWORK_MODE_LTE_CMDA_EVDO_GSM_WCDMA in order to use 4G
+        switch (rat) {
+            case PREF_NET_TYPE_GSM_ONLY:    /* GSM ONLY*/
+                nwscanmode = 1;
+            break;
+            case PREF_NET_TYPE_WCDMA: /* WCDMA ONLY*/
+                nwscanmode = 2; //3G only
+            break;
+            case PREF_NET_TYPE_CDMA_ONLY: /* CDMA ONLY*/
+                nwscanmode = 6;
+            break;
+            case PREF_NET_TYPE_EVDO_ONLY: /* EvDo ONLY*/
+                nwscanmode = 5; //3G only
+            break;
+            case PREF_NET_TYPE_CDMA_EVDO_AUTO:
+                nwscanmode = 8;
+            break;
+            case PREF_NET_TYPE_LTE_ONLY: /* LTE ONLY*/
+                nwscanmode = 3;
+            break;
+            case PREF_NET_TYPE_LTE_CDMA_EVDO: /* LTE, CDMA and EvDo */
+            case PREF_NET_TYPE_LTE_GSM_WCDMA: /* LTE, GSM/WCDMA */
+            case PREF_NET_TYPE_LTE_CMDA_EVDO_GSM_WCDMA: /* LTE, CDMA, EvDo, GSM/WCDMA */
+            default:
+                nwscanmode = 0; //Auto
+            break;
+        }
+    }
 
-    ql_nwscanmode = nwscanmode;
-    ql_nwscanseq = nwscanseq;
-    RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+    err = at_send_command_multiline("AT+QCFG=\"nwscanmode\";+QCFG=\"nwscanseq\"", "+QCFG: ", &atResponse);
+    if ((0 == err) && (NULL != atResponse) && (0 != atResponse->success)) {
+        line = atResponse->p_intermediates->line;
+
+        err = at_tok_start(&line);
+        if (err < 0) goto send_command;
+
+        err = skipComma(&line);
+        if (err < 0) goto send_command;
+
+        err = at_tok_nextint(&line, &cur_scanmode);
+        if (err < 0) goto send_command;
+
+        scanmode_set = (cur_scanmode != nwscanmode);
+
+        line = atResponse->p_intermediates->p_next ? atResponse->p_intermediates->p_next->line : NULL;
+        err = at_tok_start(&line);
+        if (err < 0) goto send_command;
+
+        err = skipComma(&line);
+        if (err < 0) goto send_command;
+
+        err = at_tok_nextstr(&line, &cur_scanseq);
+        if (err < 0) goto send_command;
+        LOGD("[%s:%d] cur_scanseq = %s\n", __func__, __LINE__, cur_scanseq);
+
+#define UC20_NWSCANSEQ "0"
+#define EC20_NWSCANSEQ "0405030201"
+        if (ql_is_UC20) {
+            default_scanseq = UC20_NWSCANSEQ;
+        } else if (ql_is_EC20) {
+            default_scanseq = EC20_NWSCANSEQ;
+        }
+        scanseq_set = (strlen(default_scanseq) != strlen(cur_scanseq)) || strncmp(cur_scanseq, default_scanseq, strlen(default_scanseq));
+    }
+send_command:
+#if 1
+//ususally, customers set "XXX only mode" only for test, so wo can ignore nwscanseq setting
+    if (scanseq_set) {
+        if (NULL != default_scanseq) {
+            asprintf(&cmd, "AT+QCFG=\"nwscanseq\",%s", default_scanseq);
+            err = at_send_command(cmd, NULL);
+            free(cmd);
+            cmd = NULL;
+        } else {
+            err = 0;
+        }
+        if (err != 0)
+            goto error;
+    }
+    if (scanmode_set) {
+        asprintf(&cmd,  "AT+QCFG=\"nwscanmode\",%d", nwscanmode);
+        err = at_send_command(cmd, NULL);
+        free(cmd);
+        if (err != 0)
+            goto error;
+    }
+#endif
+
+success:
+    if (t != NULL)
+        RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+    if (NULL != atResponse) {
+        at_response_free(atResponse);
+        atResponse = NULL;
+    }
     return;
 	
 error:
     LOGE("ERROR: requestSetPreferredNetworkType() failed\n");
-    RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+    if (t != NULL)
+        RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+    if (NULL != atResponse) {
+        at_response_free(atResponse);
+        atResponse = NULL;
+    }
 }
 
 /*
@@ -2310,11 +2936,11 @@ static void requestReportSTKServiceIsRunning(RIL_Token t)
     RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
 }
 
-/* 
+/*
  * Function: requestDeactivateDefaultPDP
  * Purpose :
  * Request : RIL_REQUEST_DEACTIVATE_DATA_CALL
- */ 
+ */
 static void requestDeactivateDefaultPDP(void *data, size_t datalen, RIL_Token t)
 {
     char * cid;
@@ -2322,11 +2948,15 @@ static void requestDeactivateDefaultPDP(void *data, size_t datalen, RIL_Token t)
 
     LOGD("requestDeactivateDefaultPDP()");
 
+    bSetupDataCallCompelete = 0;
     if (!strncmp(PPP_TTY_PATH, "ppp", 3))
         ql_pppd_stop(SIGTERM);
     else
         ql_ndis_stop(SIGTERM);
-    cid = ((char **)data)[0];
+    if (data != NULL)
+        cid = ((char **)data)[0];
+    else
+        cid = "1";
     asprintf(&cmd, "AT+CGACT=0,%s", cid);
 #if 1 //it is not need to send this AT to deactive pdp, only to check pdp status
     at_send_command_multiline("AT+CGACT?", "+CGACT:", NULL);
@@ -2335,13 +2965,19 @@ static void requestDeactivateDefaultPDP(void *data, size_t datalen, RIL_Token t)
 #endif
 
     free(cmd);
-    
-    RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+
+    if (t != NULL)
+        RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+    else
+        RIL_onUnsolicitedResponse(RIL_UNSOL_DATA_CALL_LIST_CHANGED, NULL, 0);
     return;
 
 error:
     LOGE("%s error\n",__func__);
-    RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+    if (t != NULL)
+        RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+    else
+        RIL_onUnsolicitedResponse(RIL_UNSOL_DATA_CALL_LIST_CHANGED, NULL, 0);
 }
 
 /**
@@ -2357,7 +2993,7 @@ static int s_lastPdpFailCause = PDP_FAIL_ERROR_UNSPECIFIED;
 static void requestLastPDPFailCause(RIL_Token t)
 {
     RIL_onRequestComplete(t, RIL_E_SUCCESS, &s_lastPdpFailCause, sizeof(int));
-} 
+}
 
 static void requestGsmGetBroadcastSmsConfig(RIL_Token t) {
 	RIL_onRequestComplete(t, RIL_E_REQUEST_NOT_SUPPORTED, NULL, 0);
@@ -2386,6 +3022,17 @@ static void requestQueryCallForwardStatus(void *data, size_t datalen, RIL_Token 
     ATResponse *atResponse;
     int i = 0;
 
+    if (ql_is_EC20) { //will make modules register 2G/3G from 4G
+        i = 0;
+        r_callForwardInfo[i] = (RIL_CallForwardInfo *)alloca(sizeof(RIL_CallForwardInfo));
+        bzero(r_callForwardInfo[i],sizeof(RIL_CallForwardInfo));
+        r_callForwardInfo[i]->number = (char *)alloca(15);
+        bzero(r_callForwardInfo[i]->number,15);
+        i++;
+        RIL_onRequestComplete(t, RIL_E_SUCCESS, r_callForwardInfo, i * sizeof(RIL_CallForwardInfo *));
+        return;
+    }
+
     asprintf(&cmd,"AT+CCFC=%d,2",callForwardInfo->reason);
     err = at_send_command_multiline(cmd,"+CCFC:",&atResponse);
     free(cmd);
@@ -2393,7 +3040,7 @@ static void requestQueryCallForwardStatus(void *data, size_t datalen, RIL_Token 
         goto error;
 
     tmp = atResponse->p_intermediates;
-    while (tmp) 
+    while (tmp)
     {
         r_callForwardInfo[i] = (RIL_CallForwardInfo *)alloca(sizeof(RIL_CallForwardInfo));
         bzero(r_callForwardInfo[i],sizeof(RIL_CallForwardInfo));
@@ -2429,6 +3076,11 @@ static void requestSetCallForward(void *data, size_t datalen, RIL_Token t)
     int err;
     RIL_CallForwardInfo *callForwardInfo = (RIL_CallForwardInfo *)data;
 
+    if (ql_is_EC20) { //will make modules register 2G/3G from 4G
+        RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+        return;
+    }
+
     if(callForwardInfo->serviceClass == 0)
     {
         asprintf(&cmd,"AT+CCFC=%d,%d,\"%s\",%d",
@@ -2456,18 +3108,18 @@ static void requestGetClir(RIL_Token t)
 {
     int err;
     int response[2];
-    int n; 
+    int n;
     int m;
     char *line = NULL;
     ATResponse *atResponse = NULL;
 
     err = at_send_command_singleline("AT+CLIR?","+CLIR:",&atResponse);
 	if (err != 0) goto error;
-    
+
 	line = atResponse->p_intermediates->line;
 	err = at_tok_start(&line);
 	if (err < 0) goto error;
-    
+
     err = at_tok_nextint(&line,&n);
 	if (err < 0) goto error;
 
@@ -2507,7 +3159,7 @@ static void requestQueryCallWaiting(void *data, size_t datalen, RIL_Token t)
     int err;
     char *cmd = NULL;
     int response[2];
-    int status; 
+    int status;
     int class;
     char *line = NULL;
     ATResponse *atResponse = NULL;
@@ -2515,11 +3167,11 @@ static void requestQueryCallWaiting(void *data, size_t datalen, RIL_Token t)
     asprintf(&cmd, "AT+CCWA=1,2,%d",((int *)data)[0]);
     err = at_send_command_singleline(cmd,"+CCWA:",&atResponse);
 	if (err != 0) goto error;
-    
+
 	line = atResponse->p_intermediates->line;
 	err = at_tok_start(&line);
 	if (err < 0) goto error;
-    
+
     err = at_tok_nextint(&line,&status);
 	if (err < 0) goto error;
 
@@ -2564,7 +3216,7 @@ static void requestDtmfStart(void *data, size_t datalen, RIL_Token t)
     asprintf(&cmd,"AT+VTS=%c",((char *)data)[0]);
 
     err = at_send_command(cmd,NULL);
-	if (err != 0) 
+	if (err != 0)
 		goto error;
 
 	RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
@@ -2577,14 +3229,14 @@ static void requestSetMute(void *data, size_t datalen, RIL_Token t)
 {
 	int err;
     char *cmd = NULL;
-    
+
 	assert (datalen >= sizeof(int *));
 
 	/* mute */
     asprintf(&cmd, "AT+CMUT=%d", ((int*)data)[0]);
 	err = at_send_command(cmd, NULL);
-    
-	if (err != 0) 
+
+	if (err != 0)
 		goto error;
 
 	RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
@@ -2664,7 +3316,7 @@ error:
  * for searching and registering.
  *
  * Request :RIL_REQUEST_GET_PREFERRED_NETWORK_TYPE
- */ 
+ */
 static void requestGetPreferredNetworkType(RIL_Token t)
 {
 	/*
@@ -2673,65 +3325,96 @@ static void requestGetPreferredNetworkType(RIL_Token t)
 	 * AT+QCFG="nwscanmode",2       WCDMA ONLY
 	 */
 
-	ATResponse *atResponse = NULL;
-	int err;
-	char *line;
-	int ret;
-	int response = PREF_NET_TYPE_GSM_WCDMA;
+    ATResponse *atResponse = NULL;
+    int err;
+    char *line;
+    int ret;
+    int nwscanmode = PREF_NET_TYPE_GSM_WCDMA;
 
     if (ql_is_GSM) {/* For 2G module, it only work in GSM */
-        response = PREF_NET_TYPE_GSM_ONLY;
-        RIL_onRequestComplete(t, RIL_E_SUCCESS, &response, sizeof(int));
+        nwscanmode = PREF_NET_TYPE_GSM_ONLY;
+        RIL_onRequestComplete(t, RIL_E_SUCCESS, &nwscanmode, sizeof(int));
         return;
     }
 
-	err = at_send_command_singleline("AT+QCFG=\"nwscanmode\"", "+QCFG:", &atResponse);
+    err = at_send_command_multiline("AT+QCFG=\"nwscanmode\";+QCFG=\"nwscanseq\"", "+QCFG: ", &atResponse);
 
-	if (err != 0) {
-		// assume radio is off
-		goto error;
-	}
+    if (err != 0) {
+    	// assume radio is off
+    	goto error;
+    }
 
-	line = atResponse->p_intermediates->line;
+    line = atResponse->p_intermediates->line;
 
-	err = at_tok_start(&line);
-	if (err < 0) goto error;
-
-	err = skipComma(&line);
+    err = at_tok_start(&line);
     if (err < 0) goto error;
 
-	err = at_tok_nextint(&line, &ret);
-	if (err < 0) goto error;
+    err = skipComma(&line);
+    if (err < 0) goto error;
 
-	/* Based on reported +QCFG: "nwscanmode" */
-	if (ret == 1) {
-		response = PREF_NET_TYPE_GSM_ONLY;  /* GSM only */
-	} else if (ret == 2) {
-		response = PREF_NET_TYPE_WCDMA; /* WCDMA only */
-	} else {
-		response = PREF_NET_TYPE_GSM_WCDMA; /* for 3G Preferred */
-	}
-	
-	D("requestGetPreferredNetworkType() mode:%d\n",response);
-	RIL_onRequestComplete(t, RIL_E_SUCCESS, &response, sizeof(int));
-	at_response_free(atResponse);	
-	return;
+    err = at_tok_nextint(&line, &ret);
+    if (err < 0) goto error;
+
+    /* Based on reported +QCFG: "nwscanmode" */
+    if (ret == 1) {
+    	nwscanmode = PREF_NET_TYPE_GSM_ONLY;  /* GSM only */
+    } else if (ret == 2) {
+    	nwscanmode = PREF_NET_TYPE_WCDMA; /* WCDMA only */
+    } else {
+    	nwscanmode = PREF_NET_TYPE_GSM_WCDMA; /* for 3G Preferred */
+    }
+
+    if (ql_is_EC20) { //4G modules
+//RILConstants.java (frameworks\base\telephony\java\com\android\internal\telephony)
+//int PREFERRED_NETWORK_MODE      = NETWORK_MODE_WCDMA_PREF;
+//must change to NETWORK_MODE_LTE_CMDA_EVDO_GSM_WCDMA in order to use 4G
+        switch (ret) {
+            case 1:    /* GSM ONLY*/
+                nwscanmode = PREF_NET_TYPE_GSM_ONLY;
+            break;
+            case 2: /* WCDMA ONLY*/
+                nwscanmode = PREF_NET_TYPE_WCDMA; //3G only
+            break;
+            case 6: /* CDMA ONLY*/
+                nwscanmode = PREF_NET_TYPE_CDMA_ONLY;
+            break;
+            case 5: /* EvDo ONLY*/
+                nwscanmode = PREF_NET_TYPE_EVDO_ONLY; //3G only
+            break;
+            case 8:
+                nwscanmode = PREF_NET_TYPE_CDMA_EVDO_AUTO;
+            break;
+            case 3: /* LTE ONLY*/
+                nwscanmode = PREF_NET_TYPE_LTE_ONLY;
+            break;
+            case 0:
+            default:
+                nwscanmode = PREF_NET_TYPE_LTE_GSM_WCDMA;
+                //if (strStartsWith(ql_product_version, "EC20CE")) response = PREF_NET_TYPE_LTE_CMDA_EVDO_GSM_WCDMA;                      
+            break;
+        }
+    }
+    
+    RLOGD("requestGetPreferredNetworkType() mode:%d\n",nwscanmode);
+    RIL_onRequestComplete(t, RIL_E_SUCCESS, &nwscanmode, sizeof(int));
+    at_response_free(atResponse);	
+    return;
 	
 error:
-	LOGE("ERROR: requestGetPreferredNetworkType() failed - modem does not support command\n");
-	RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
-	at_response_free(atResponse);
+    LOGE("ERROR: requestGetPreferredNetworkType() failed - modem does not support command\n");
+    RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
+    at_response_free(atResponse);
 }
 //Add by wythe on 2013-9-27 ->end
 
 struct operatorPollParams {
     RIL_Token t;
     int loopcount;
-}; 
+};
 
 
-#define REPOLL_OPERATOR_SELECTED 30     
-static const struct timeval TIMEVAL_OPERATOR_SELECT_POLL = { 2, 0 }; 
+#define REPOLL_OPERATOR_SELECTED 30
+static const struct timeval TIMEVAL_OPERATOR_SELECT_POLL = { 2, 0 };
 
 /**
  * Poll +COPS? and return a success, or if the loop counter reaches
@@ -2951,9 +3634,8 @@ do_auto:
     err = at_send_command("AT+COPS=0", NULL);
     if (err != 0)
         goto error;
-    if (ql_nwscanseq && ql_nwscanmode) {
-        at_send_command(ql_nwscanseq, NULL);
-        at_send_command(ql_nwscanmode, NULL);
+    if (s_lastPreferredNetworkType != -1) {
+        requestSetPreferredNetworkType(&s_lastPreferredNetworkType, sizeof(int *), NULL);
     }
 
 finish_scan:
@@ -2973,7 +3655,7 @@ error:
     free(poll_params);
     at_response_free(atResponse);
     RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
-    return;    
+    return;
 }
 
 /**
@@ -3006,11 +3688,10 @@ void requestSetNetworkSelectionManual(void *data, size_t datalen,
     err = at_send_command(cmd, NULL);
     if (err != 0) {
         err = at_send_command("AT+COPS=0",NULL);
-        if(err != 0) 
+        if(err != 0)
             goto error;
-        if (ql_nwscanseq && ql_nwscanmode) {
-            at_send_command(ql_nwscanseq, NULL);
-            at_send_command(ql_nwscanmode, NULL);
+        if (s_lastPreferredNetworkType != -1) {
+            requestSetPreferredNetworkType(&s_lastPreferredNetworkType, sizeof(int *), NULL);
         }
     }
 
@@ -3113,7 +3794,7 @@ static void requestQueryAvailableNetworks(RIL_Token t)
 
         //stat <oper>
         err = at_tok_nextint(&p_line, &status);
-        if(err < 0) 
+        if(err < 0)
         {
 error_response:
             free(s);
@@ -3127,7 +3808,7 @@ error_response:
 						free(s);
 						continue;
 				}
-#endif   
+#endif
         //long alphanumeric <oper>
         err = at_tok_nextstr(&p_line, &long_alphanumeric);
         if(err < 0) goto error_response;
@@ -3162,12 +3843,12 @@ error_response:
         strcpy(responseArray[i*QUERY_AVAILABLE_NW_PARAMS_NUM + 2], numeric);
 
         free(s);
-        
+
         /**
          *  If module responds empty sring for long alphanumeric and short alphanumeric,
          *  then we copy the MNC/MMC to them.
          */
-        
+
         if (responseArray[i * QUERY_AVAILABLE_NW_PARAMS_NUM + 0] && strlen(responseArray[i * QUERY_AVAILABLE_NW_PARAMS_NUM + 0]) == 0) {
             responseArray[i * QUERY_AVAILABLE_NW_PARAMS_NUM + 0] = (char*) alloca(strlen(responseArray[i * QUERY_AVAILABLE_NW_PARAMS_NUM + 2]) + 1);
             strcpy(responseArray[i * QUERY_AVAILABLE_NW_PARAMS_NUM + 0], responseArray[i * QUERY_AVAILABLE_NW_PARAMS_NUM + 2]);
@@ -3182,13 +3863,13 @@ error_response:
         responseArray[i * QUERY_AVAILABLE_NW_PARAMS_NUM + 3] = (char*) alloca(strlen(statusTable[status])+1);
 				strcpy(responseArray[i * QUERY_AVAILABLE_NW_PARAMS_NUM + 3],statusTable[status]);
     }
-    
+
     RIL_onRequestComplete(t, RIL_E_SUCCESS, responseArray, i * QUERY_AVAILABLE_NW_PARAMS_NUM * sizeof(char *));
 
 finally:
     at_response_free(atResponse);
     return;
-    
+
 error:
     LOGE("ERROR:requestQueryAvailableNetworks() get no response form module\n");
     RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
@@ -3215,7 +3896,7 @@ void requestGetNeighboringCellIDs(RIL_Token t)
         goto error;
 
     tmp = atresponse->p_intermediates;
-    while (tmp) 
+    while (tmp)
     {
         if (n > MAX_NUM_NEIGHBOR_CELLS)
             goto error;
@@ -3382,6 +4063,100 @@ static void requestSetCellInfoListRate(void *data, size_t datalen, RIL_Token t)
 }
 #endif
 
+#ifdef RIL_REQUEST_DEVICE_IDENTITY
+static void requestDeviceIdentity(RIL_Token t)
+{
+    int err = 0;
+    int i = 0;
+	int ret = 0;
+    ATLine *p_cur = NULL;
+	char *line = NULL;
+	char *ptmp = NULL;
+#define IDENTITY_NUM 4
+    char *response[IDENTITY_NUM] = {0};
+	char *at_cmd[IDENTITY_NUM] = {"AT+CGSN", "AT+CGMR", "AT+EGMR=0,8", "AT+EGMR=0,8"};
+#define MEID_LEN 16
+	char meid[MEID_LEN + 1] = {0};
+
+    ATResponse *p_response = NULL;
+    ATResponse *cgmr_response = NULL;
+
+    LOGE("%s begin.\n", __func__);
+#if 1
+    err = at_send_command_numeric("AT+CGSN", &p_response);
+    if (err < 0 || p_response == NULL ||  0 == p_response->success) { 
+        LOGE("%s error for AT+CGSN!\n", __func__);
+        ret--;
+    } else {
+        response[0] = p_response->p_intermediates->line;
+        //response[2] = p_response->p_intermediates->line;
+        memcpy(meid, p_response->p_intermediates->line, MEID_LEN);
+        ptmp = (char *)(&meid[0]);
+        while ((NULL != ptmp) && ('\0' != *ptmp++));
+            if ((NULL != ptmp) && ('\0' != *(ptmp - 2))) {
+                *(ptmp - 2) = 0;
+            }
+        response[3] = (char *)(&meid[0]);
+    }
+    
+    err = at_send_command_singleline("AT+CGMR", "\0", &cgmr_response);
+    if ((err < 0) || cgmr_response == NULL || 0 == cgmr_response->success) { 
+        LOGE("%s error for AT+CGMR!\n", __func__);
+        ret--;
+    } else {
+            response[1] = cgmr_response->p_intermediates->line;
+    }
+#else
+	for (i = 0; i < IDENTITY_NUM; i++) {
+		err = at_send_command(at_cmd[i], &p_response);
+
+	    if ((err < 0) || (0 == p_response->success)) { 
+		    LOGE("%s error for %s!\n", __func__, at_cmd[i]);
+			if ((2 == i) || (3 == i)) {
+				response[i] = "80C93228";  //dumy esn or meid
+			} else {
+			    ret--;
+			}
+	    } else {
+			if ((2 == i) || (3 == i)) {
+				line = p_response->p_intermediates->line;
+				err = at_tok_start(&line);
+				err = at_tok_nextstr(&line, &ptmp);
+				if ((0 == err) && (NULL != ptmp)) {
+				    if (0 == strncmp(ptmp, "0x", strlen("0x"))) {
+					    ptmp += 2; //skip "0x"
+					}
+				}
+				response[i] = ptmp;
+				while ((NULL != ptmp) && ('"' != *ptmp) && (0 != *ptmp)) {
+				    ptmp++;
+				}
+				if ('"' == *ptmp) {
+					*ptmp = 0;
+				}
+			} else {
+		        response[i] = p_response->p_intermediates->line;
+			}
+			LOGE("responese[%d] = %s\n", i, (NULL != response[i]) ? response[i] : "");
+	    }
+
+	}
+    #endif
+	for (i = 0; i < IDENTITY_NUM; i++) {
+	    LOGE("%s : response[%d] = %s\n", __func__, i, (NULL != response[i]) ? response[i] : "");
+	}
+    if (ret < 0) {
+        RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, response, sizeof(response));
+	} else {
+        RIL_onRequestComplete(t, RIL_E_SUCCESS, response, sizeof(response));
+	}
+    at_response_free(p_response);
+	at_response_free(cgmr_response);
+    LOGE("%s end, ret = %d\n", __func__, ret);
+    return;
+
+}
+#endif
 
 /*** Callback methods from the RIL library to us ***/
 
@@ -3403,12 +4178,14 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
     ATResponse *p_response;
     int err;
 
+#ifdef USE_NDK
+    if (requestToString != NULL)
+#endif
     LOGD("onRequest: %s", requestToString(request));
 
 #if 1 //quectel  //frameworks\base\telephony\java\com\android\internal\telephony/RIL.java ->processUnsolicited()
     onRequestCount++;
 #endif
-
     switch (request) {
 
         /**** call ****/
@@ -3420,45 +4197,45 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
             }
             requestGetCurrentCalls(data, datalen, t);
             break;
-            
+
         case RIL_REQUEST_DIAL:
             requestDial(data, datalen, t);
             break;
-            
+
         case RIL_REQUEST_HANGUP:
             requestHangup(data, datalen, t);
             break;
-            
+
         case RIL_REQUEST_HANGUP_WAITING_OR_BACKGROUND:
             at_send_command("AT+CHLD=0", NULL);
 
             RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
             break;
-            
+
         case RIL_REQUEST_HANGUP_FOREGROUND_RESUME_BACKGROUND:
             at_send_command("AT+CHLD=1", NULL);
 
             RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
             break;
-            
+
         case RIL_REQUEST_SWITCH_WAITING_OR_HOLDING_AND_ACTIVE:
             at_send_command("AT+CHLD=2", NULL);
 
             RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
             break;
-            
+
         case RIL_REQUEST_ANSWER:
             at_send_command("ATA", NULL);
 
             RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
             break;
-            
+
         case RIL_REQUEST_CONFERENCE:
             at_send_command("AT+CHLD=3", NULL);
 
             RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
             break;
-            
+
         case RIL_REQUEST_UDUB:
             at_send_command("ATH", NULL);
 
@@ -3480,7 +4257,7 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
                 }
             }
             break;
-        //--------------------------------------------------------    
+        //--------------------------------------------------------
 
         /**** sms ****/
         //--------------------------------------------------------
@@ -3515,6 +4292,31 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
             at_response_free(p_response);
             break;
         }
+
+        case RIL_REQUEST_CDMA_SEND_SMS:
+             requestSendCdmaSMS(data, datalen, t);
+            break;
+
+        case RIL_REQUEST_CDMA_SMS_ACKNOWLEDGE:
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
+        break;
+
+        case RIL_REQUEST_CDMA_SUBSCRIPTION: {
+            /**
+            * "response" is const char **
+            * ((const char **)response)[0] is MDN if CDMA subscription is available
+            * ((const char **)response)[1] is a comma separated list of H_SID (Home SID) if
+            *                              CDMA subscription is available, in decimal format
+            * ((const char **)response)[2] is a comma separated list of H_NID (Home NID) if
+            *                              CDMA subscription is available, in decimal format
+            * ((const char **)response)[3] is MIN (10 digits, MIN2+MIN1) if CDMA subscription is available
+            * ((const char **)response)[4] is PRL version if CDMA subscription is available
+            **/
+            char * cmd_subscription[] = {"17756067602", "14151", "3734", "0912121001"};
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, cmd_subscription, 4 * sizeof(char *));
+            break;
+        }
+
         //--------------------------------------------------------
 
         /**** data connection ****/
@@ -3536,7 +4338,7 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
         case RIL_REQUEST_DATA_CALL_LIST:
             requestDataCallList(data, datalen, t);
             break;
-        //--------------------------------------------------------    
+        //--------------------------------------------------------
 
         /**** network ****/
         //--------------------------------------------------------
@@ -3544,8 +4346,8 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
             if (currentState() <= RADIO_STATE_UNAVAILABLE) {
                 RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
                 break;
-            }            
-            if (ql_is_UC20 || ql_is_GSM)
+            }
+            if (ql_is_UC20 || ql_is_GSM || ql_is_EC20)
                 requestSetPreferredNetworkType(data,datalen,t);
             else
                 RIL_onRequestComplete(t, RIL_E_REQUEST_NOT_SUPPORTED, NULL, 0);
@@ -3554,29 +4356,29 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
         case RIL_REQUEST_SIGNAL_STRENGTH:
             requestSignalStrength(data, datalen, t);
             break;
-            
+
         case RIL_REQUEST_VOICE_REGISTRATION_STATE:
         case RIL_REQUEST_DATA_REGISTRATION_STATE:
             if (currentState() != RADIO_STATE_SIM_READY) {
                 char * response[] = {"0"}; //Not registered
                 RIL_onRequestComplete(t, RIL_E_SUCCESS, response, sizeof(response));
                 break;
-            }  
+            }
             requestRegistrationState(request, data, datalen, t);
             break;
-            
+
         case RIL_REQUEST_OPERATOR:
             if (currentState() != RADIO_STATE_SIM_READY) {
                 char *response[] = {NULL, NULL, NULL};
-                RIL_onRequestComplete(t, RIL_E_SUCCESS, response, sizeof(response)); 
+                RIL_onRequestComplete(t, RIL_E_SUCCESS, response, sizeof(response));
                 break;
-            } 
+            }
             requestOperator(data, datalen, t);
             break;
 
 				/***
 				 *	Drop.
-				 *	wythe 2014-3-28 
+				 *	wythe 2014-3-28
 				 */
 #if 0
         case RIL_REQUEST_SET_NETWORK_SELECTION_AUTOMATIC:
@@ -3587,9 +4389,9 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
         case RIL_REQUEST_QUERY_NETWORK_SELECTION_MODE:
             if (currentState() != RADIO_STATE_SIM_READY) {
                 int response[] = {0};
-                RIL_onRequestComplete(t, RIL_E_SUCCESS, response, sizeof(response)); 
+                RIL_onRequestComplete(t, RIL_E_SUCCESS, response, sizeof(response));
                 break;
-            } 
+            }
             requestQueryNetworkSelectionMode(data, datalen, t);
             break;
 
@@ -3598,7 +4400,7 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
          *  Wythe 2013-9-27
          */
         case RIL_REQUEST_GET_PREFERRED_NETWORK_TYPE:
-        if (ql_is_UC20 || ql_is_GSM)
+        if (ql_is_UC20 || ql_is_GSM || ql_is_EC20)
             requestGetPreferredNetworkType(t);
         else
             	RIL_onRequestComplete(t, RIL_E_REQUEST_NOT_SUPPORTED, NULL, 0);
@@ -3628,8 +4430,8 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
         case RIL_REQUEST_SET_NETWORK_SELECTION_AUTOMATIC:
             requestSetNetworkSelectionAutomatic(t);
             break;
-            
-        //--------------------------------------------------------    
+
+        //--------------------------------------------------------
 
         /**** sim card ****/
         //--------------------------------------------------------
@@ -3647,6 +4449,19 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
                 buffer_size = 0;
             }
             RIL_onRequestComplete(t, result, p_buffer, buffer_size);
+#if 1 //byd, after restart rild, make SIMRecords.java boardcast recordsLoaded event, then make GsmDataConnectionTracker.java to setupDataOnReadyApns 
+            if (p_card_status->card_state == RIL_CARDSTATE_PRESENT) {
+                char prop_value[PROPERTY_VALUE_MAX] = {'\0'};
+                static int rild_restart = 1;
+                if (rild_restart && property_get("gsm.sim.state", prop_value, NULL) && !strcmp(prop_value, "READY")) {
+                    //rild restart
+                    int response[3] = {SIM_INIT, 0, 0};
+                    RIL_onUnsolicitedResponse (RIL_UNSOL_SIM_REFRESH, response, sizeof(response));
+                }
+                rild_restart = 0;
+                LOGD("gsm.sim.state = %s", prop_value);
+            }
+#endif
             freeCardStatus(p_card_status);
             break;
         }
@@ -3659,6 +4474,21 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
                 LOGE("%s error for RIL_REQUEST_GET_IMSI!\n", __func__);
                 RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
             } else {
+                // it is better to according AT+CPIN? 's result, if it is a cdma RUIM card
+                if (ql_is_EC20 && strStartsWith(ql_product_version, "EC20CE")) { //EC20 with China Telecom 3G RUIM card bug.
+                    if (strStartsWith(p_response->p_intermediates->line, "20404")) { //Vodafone
+                        char value[PROPERTY_VALUE_MAX];
+                        property_get("ro.cdma.home.operator.numeric", value, "46003");
+                        memcpy(p_response->p_intermediates->line, value, strlen(value));
+                    } else if (strStartsWith(p_response->p_intermediates->line, "46099")) { //abnormal imsi
+                        memcpy(p_response->p_intermediates->line, "46003", strlen("46003"));
+                    }
+                }
+#define OPERNUM_LEN 5
+                char tmpstr[OPERNUM_LEN + 1] = {0};
+                memcpy(tmpstr, p_response->p_intermediates->line, OPERNUM_LEN);
+                quectel_cimi = atoi(tmpstr);
+                LOGD("[%s:%d] quectel_cimi = %d.\n", __func__, __LINE__, quectel_cimi);
                 RIL_onRequestComplete(t, RIL_E_SUCCESS,
                     p_response->p_intermediates->line, sizeof(char *));
             }
@@ -3691,14 +4521,14 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
         case RIL_REQUEST_ENTER_SIM_PUK2:
             requestEnterSimPin(data, datalen, t,request);
             break;
-        //--------------------------------------------------------    
-            
+        //--------------------------------------------------------
+
         /**** other,e.g. system, baseband information****/
         case RIL_REQUEST_SCREEN_STATE: {
             if (currentState() != RADIO_STATE_SIM_READY) {
                 RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
                 break;
-            }   
+            }
             requestScreenState(data,datalen,t);
             break;
         }
@@ -3712,7 +4542,7 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
             requestGetIMEISV(t);
             break;
         }
-       
+
         case RIL_REQUEST_REPORT_STK_SERVICE_IS_RUNNING: {
             requestReportSTKServiceIsRunning(t);
             break;
@@ -3740,10 +4570,6 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
         }
 
         case RIL_REQUEST_GET_IMEI:
-            if (ql_is_EC20) { //EC20 bug, canot get OK
-                //RIL_onRequestComplete(t, RIL_E_SUCCESS, "355189036244202", sizeof(char *));
-                //return;
-            }
             p_response = NULL;
             err = at_send_command_numeric("AT+CGSN", &p_response);
 
@@ -3755,6 +4581,10 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
                     p_response->p_intermediates->line, sizeof(char *));
             }
             at_response_free(p_response);
+            break;
+
+		case RIL_REQUEST_DEVICE_IDENTITY:
+            requestDeviceIdentity(t);
             break;
 
         case RIL_REQUEST_SEND_USSD:
@@ -3780,7 +4610,7 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
                 int err;
                 int bandval = 0;
                 char *cmd;
-                
+
                 switch(((int *)data)[0])
                 {
                     case 1:
@@ -3820,7 +4650,7 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
         case RIL_REQUEST_GET_SMSC_ADDRESS:
             {
                 ATResponse *p_response = NULL;
-                char *cmd = NULL; 
+                char *cmd = NULL;
                 char *SMSC_address = NULL;
                 int err;
 
@@ -3853,7 +4683,7 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
         case RIL_REQUEST_SET_SMSC_ADDRESS:
             {
                 ATResponse *p_response = NULL;
-                char *cmd = NULL; 
+                char *cmd = NULL;
                 char *SMSC_address = NULL;
                 int err;
 #ifdef CUSD_USE_UCS2_MODE
@@ -3865,10 +4695,10 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
                     ucs2_addr[i*4 + 1] =  '0';
                     ucs2_addr[i*4 + 2] =  bytesToHexString[((char *)data)[i] >> 4];
                     ucs2_addr[i*4 + 3] =  bytesToHexString[((char *)data)[i] & 0xf];
-                }  
+                }
                 data = ucs2_addr;
 #endif
-                
+
                 SMSC_address = data;
                 asprintf(&cmd,"AT+CSCA=\"%s\"",SMSC_address);
 
@@ -3941,7 +4771,7 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
         }
 
         case RIL_REQUEST_RESET_RADIO: {
-        if (ql_is_UC20)            
+        if (ql_is_UC20)
             requestResetRadio(t);
         else
             	RIL_onRequestComplete(t, RIL_E_REQUEST_NOT_SUPPORTED, NULL, 0);
@@ -4014,21 +4844,8 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
         if (ql_is_UC20)
             requestGetNeighboringCellIDs(t);
         else
-              RIL_onRequestComplete(t, RIL_E_REQUEST_NOT_SUPPORTED, NULL, 0);          
+              RIL_onRequestComplete(t, RIL_E_REQUEST_NOT_SUPPORTED, NULL, 0);
             break;
-
-#ifdef RIL_REQUEST_QUECTEL_AT
-        case RIL_REQUEST_QUECTEL_AT: {
-		ATResponse *p_response = NULL;
-		int err = at_send_command((const char *)data,&p_response);
-		//if(err < 0 || p_response == NULL || p_response->success == 0)
-		//RIL_onRequestComplete(t, RIL_E_GENERIC_FAILURE, NULL, 0);
-		//else
-		//RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
-		free(p_response);
-		break;
-	}
-#endif
 
 #ifdef RIL_REQUEST_GET_HARDWARE_CONFIG
         case RIL_REQUEST_GET_HARDWARE_CONFIG:
@@ -4051,45 +4868,45 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
         case RIL_REQUEST_SET_TTY_MODE:
             RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
             break;
-            
+
         case RIL_REQUEST_QUERY_TTY_MODE:    {
             int response[] = {0}; // * ((int *)response)[0] is == 0 for TTY off
-            RIL_onRequestComplete(t, RIL_E_SUCCESS, response, sizeof(response)); 
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, response, sizeof(response));
             break;
         }
 
 #ifdef RIL_REQUEST_IMS_REGISTRATION_STATE
         case RIL_REQUEST_IMS_REGISTRATION_STATE: {
             int response[] = {0, 0}; //  0 - Not registered
-            RIL_onRequestComplete(t, RIL_E_SUCCESS, response, sizeof(response)); 
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, response, sizeof(response));
             break;
         }
  #endif
 
 #ifdef RIL_REQUEST_SIM_OPEN_CHANNEL
         case RIL_REQUEST_SIM_OPEN_CHANNEL:
-            RIL_onRequestComplete(t, RIL_E_REQUEST_NOT_SUPPORTED, NULL, 0); 
+            RIL_onRequestComplete(t, RIL_E_REQUEST_NOT_SUPPORTED, NULL, 0);
             break;
 #endif
 
 #ifdef RIL_REQUEST_SIM_CLOSE_CHANNEL
         case RIL_REQUEST_SIM_CLOSE_CHANNEL:
-            RIL_onRequestComplete(t, RIL_E_REQUEST_NOT_SUPPORTED, NULL, 0); 
-            break;        
+            RIL_onRequestComplete(t, RIL_E_REQUEST_NOT_SUPPORTED, NULL, 0);
+            break;
 #endif
 
 #ifdef RIL_REQUEST_SET_INITIAL_ATTACH_APN
         case RIL_REQUEST_SET_INITIAL_ATTACH_APN:
-            RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0); 
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
             break;
 #endif
 
 #ifdef RIL_REQUEST_GET_CELL_INFO_LIST
         case RIL_REQUEST_GET_CELL_INFO_LIST:
-            RIL_onRequestComplete(t, RIL_E_REQUEST_NOT_SUPPORTED, NULL, 0); 
+            RIL_onRequestComplete(t, RIL_E_REQUEST_NOT_SUPPORTED, NULL, 0);
             break;
 #endif
-   
+
         case RIL_REQUEST_CDMA_SET_SUBSCRIPTION_SOURCE:
             RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
             break;
@@ -4120,14 +4937,14 @@ static int
 onSupports (int requestCode)
 {
     (void ) requestCode;
-    LOGI("Call OnSupports\r\n");
+    LOGI("Call OnSupports");
     return 1;
 }
 
 static void onCancel (RIL_Token t)
 {
     (void) t;
-    LOGI("Call OnCancel\r\n");
+    LOGI("Call OnCancel");
 }
 
 static const char * getVersion(void)
@@ -4147,7 +4964,7 @@ setRadioState(RIL_RadioState newState)
 
     oldState = sState;
 
-    LOGI("[%s]:oldState=%d, newState=%d\r\n", __func__, oldState, newState);
+    LOGI("[%s]:oldState=%d, newState=%d", __func__, oldState, newState);
 
     if (s_closed > 0) {
         // If we're closed, the only reasonable state is
@@ -4289,6 +5106,7 @@ static int getCardStatus(RIL_CardStatus_v6 **pp_card_status) {
         { RIL_APPTYPE_SIM, RIL_APPSTATE_SUBSCRIPTION_PERSO, RIL_PERSOSUBSTATE_SIM_NETWORK,
           NULL, NULL, 0, RIL_PINSTATE_ENABLED_NOT_VERIFIED, RIL_PINSTATE_UNKNOWN }
     };
+
     RIL_CardState card_state;
     int num_apps;
 
@@ -4325,6 +5143,17 @@ static int getCardStatus(RIL_CardStatus_v6 **pp_card_status) {
 
         // Get the correct app status
         p_card_status->applications[0] = app_status_array[sim_status];
+
+#if 1
+        if (sim_status == SIM_READY && ql_is_EC20  && strStartsWith(ql_product_version, "EC20CE")) {
+            //EC20 with China Telecom 3G RUIM card bug support cdma
+            static RIL_AppStatus cdma_sim_ready_status = { RIL_APPTYPE_RUIM, RIL_APPSTATE_READY, RIL_PERSOSUBSTATE_READY,
+                NULL, NULL, 0, RIL_PINSTATE_UNKNOWN, RIL_PINSTATE_UNKNOWN };
+            p_card_status->num_applications = 2;
+            p_card_status->cdma_subscription_app_index= 1;
+            p_card_status->applications[1] = cdma_sim_ready_status;
+       }
+#endif
     }
 
     *pp_card_status = p_card_status;
@@ -4352,7 +5181,7 @@ static void onSIMStateChange (void *param)
         return;
 
         case SIM_NOT_READY:
-            setRadioState(RADIO_STATE_SIM_NOT_READY);        
+            setRadioState(RADIO_STATE_SIM_NOT_READY);
         return;
 
         case SIM_READY:
@@ -4369,7 +5198,7 @@ static void onSMSReady (void *param) {
 //AT+QINISTAT is used to query status of SIM/USIM card initialization.
     err = at_send_command_singleline("AT+QINISTAT", "+QINISTAT:", &p_response);
     if (err < 0 || p_response == NULL || p_response->success == 0) {
-        
+
     } else {
         int status;
         char *line = p_response->p_intermediates->line;
@@ -4380,7 +5209,7 @@ static void onSMSReady (void *param) {
                     // 1 Ready to execute AT command
                     // 2 Phonebook has finished initialization
                     // 3 SMS has finished initialization
-                     sms_ready = ((status & 3) == 3);                   
+                     sms_ready = ((status & 3) == 3);
                 } else if (ql_is_UC20) {
                     // 0 Initial state
                     // 1 CPIN READY. Operation like lock/unlock PIN is allowed
@@ -4398,7 +5227,7 @@ static void onSMSReady (void *param) {
         if (ql_is_GSM) {
             /**
             *  Wythe: Modify on 2013-04-02 for 4.0 ril
-            *  we support AT+CSMS=128 for GSM module and 
+            *  we support AT+CSMS=128 for GSM module and
             *  AT+CSMS=1 for WCDMA module
             */
             at_send_command_singleline("AT+CSMS=128", "+CSMS:", NULL);
@@ -4414,7 +5243,7 @@ static void onSMSReady (void *param) {
             * bfr = 1  // flush buffer
             */
             at_send_command("AT+CNMI=1,2,2,1,1", NULL);
-        } else {    
+        } else {
             at_send_command_singleline("AT+CSMS=1", "+CSMS:", NULL);
             /*
             * Always send SMS messages directly to the TE
@@ -4428,7 +5257,7 @@ static void onSMSReady (void *param) {
             */
             at_send_command("AT+CNMI=1,2,0,1,0", NULL);
         }
-        
+
         /*  SMS PDU mode */
         at_send_command("AT+CMGF=0", NULL);
     }else {
@@ -4483,18 +5312,15 @@ static int isRadioOn()
 
     if (err < 0 || p_response->success == 0) {
         // assume radio is off
-        LOGE("1err=%d\n", err);
         goto error;
     }
 
     line = p_response->p_intermediates->line;
 
     err = at_tok_start(&line);
-	LOGE("2err=%d\n", err);
     if (err < 0) goto error;
 
     err = at_tok_nextbool(&line, &ret);
-	LOGE("3err=%d\n", err);
     if (err < 0) goto error;
 
     at_response_free(p_response);
@@ -4507,6 +5333,21 @@ error:
     return -1;
 }
 
+static void initializeCustomerCallback(void *param)
+{
+#if 0
+    ATResponse *p_response = NULL;
+    int err;
+
+    //if you want to do something, send your at commands here
+    err = at_send_command_multiline("AT+QAUDMOD=2;+QSIDET=0;+CLVL=1;+QRXGAIN=25000", "\0", &p_response);
+    if (err < 0 || p_response == NULL || p_response->success == 0)
+        RIL_requestTimedCallback(initializeCustomerCallback, NULL, &TIMEVAL_1);
+    at_response_free(p_response);
+#endif
+}
+
+extern void * FwdSvcMainLoop(void *param);
 /**
  * Initialize everything that can be configured while we're still in
  * AT+CFUN=0
@@ -4517,14 +5358,14 @@ static void initializeCallback(void *param)
     int err;
 
 #if 1 //quectel
-    if (currentState() == RADIO_STATE_SIM_READY) { //maybe only usb disconnect
-    } else 
+    if (s_recovery_mode && currentState() == RADIO_STATE_SIM_READY) { //maybe only usb disconnect
+    } else
 #endif
     setRadioState (RADIO_STATE_OFF);
 
     at_handshake();
 
-#if 1 //quectel display module software version 
+#if 1 //quectel display module software version
 __get_ql_product:
     ql_is_UC20 = ql_is_EC20 = ql_is_UG95 = ql_is_GSM = 0;
     ql_product_version = NULL; //"GSMXX"	
@@ -4544,7 +5385,7 @@ __get_ql_product:
     if (!ql_product_version) {
         sleep(1);
         goto __get_ql_product;
-    }    
+    }
     LOGD("Quectel Product Revision: %s", ql_product_version);
     if (ql_is_XX("UC15") || ql_is_XX("UC20")) {
         ql_is_UC20 = 1;
@@ -4552,10 +5393,6 @@ __get_ql_product:
     } else if (ql_is_XX("EC20")) {
         ql_is_EC20 = 1;
         LOGD("ECXX");
-#if 0 //auto, LTE preferred
-    at_send_command("AT+QCFG=\"nwscanmode\",0", NULL);
-    at_send_command("AT+QCFG=\"nwscanseq\",04030201", NULL);
-#endif
     } else if (ql_is_XX("UG95") || ql_is_XX("UG96")) {
         ql_is_UG95 = 1;
         LOGD("UGXX");
@@ -4563,6 +5400,13 @@ __get_ql_product:
         ql_is_GSM = 1;
         LOGD("GSMXX");
     }
+
+    if (ql_is_XX("UC20") || ql_is_XX("EC20") || ql_is_XX("EC21") || ql_is_XX("EC25"))
+        ql_gps_init();
+    
+    if (ql_is_XX("EC20") || ql_is_XX("EC21") || ql_is_XX("EC25"))
+        ql_fwdsvc_init();
+    
     at_send_command_multiline("AT+CSUB", "\0", &p_response);
 #endif
 
@@ -4575,7 +5419,7 @@ __get_ql_product:
 
     /*  No auto-answer */
     at_send_command("ATS0=0", NULL);
-    
+
 //Joe
     if (ql_mux_enabled) {
         at_send_command("AT+QURCCFG=\"URCPORT\",\"UART1\"", NULL);
@@ -4583,7 +5427,7 @@ __get_ql_product:
     } else
         at_send_command("AT+QURCCFG=\"URCPORT\",\"usbat\"", NULL); //urcport",("usbat","usbmodem","uart1"
 
-#if 1 // quectel Set DTR Function Mode 
+#if 1 // quectel Set DTR Function Mode
 //ON->OFF on DTR: Disconnect data call, change to command mode. During state DTR = OFF, auto-answer function is disabled
     at_send_command("AT&D2", NULL);
 #endif
@@ -4593,10 +5437,10 @@ __get_ql_product:
 
     /*  Network registration events */
     at_send_command("AT+CREG=2", NULL);
-    
-//there is a change in the ME network registration status or a change of the network cell: 
-//+CGREG: <stat>[, <lac>,<ci> ] 
-    at_send_command("AT+CGREG=2", NULL); 
+
+//there is a change in the ME network registration status or a change of the network cell:
+//+CGREG: <stat>[, <lac>,<ci> ]
+    at_send_command("AT+CGREG=2", NULL);
 
 #if 1 //quectel
     if (ql_is_UC20) {
@@ -4613,6 +5457,18 @@ __get_ql_product:
         at_send_command("AT+QCFG=\"QMISYNC\",0", NULL);
     at_send_command("AT+QSCLK=1", NULL); //Configure Whether or not to Enter into Sleep Mode
 
+    if (ql_is_UC20 || ql_is_EC20) {
+        //at_send_command("AT+QCFG=\"pwrsavedtr\",0", NULL); //Enable/Disable DTR to Control Power Save State
+        //at_send_command("AT+QCFG=\"risignaltype\", \"respective\"", NULL);
+        //No matter which port URC is presented on, URC only causes the behavior of physical ring line
+        //at_send_command("AT+QCFG=\"risignaltype\", \"physical\"", NULL);
+    }
+
+    if (ql_is_EC20) { //can be used for all LTE modules? i think
+        //at_send_command("AT+CGDCONT=1,\"IPV4V6\",\"\"",  NULL);
+        at_send_command("at+qcfg=\"pdp/duplicatechk\",1", NULL); //carl allow different pdp use same APN, only for EC20?
+    }
+
 #if 0
     at_send_command("AT+QCFG=\"usb/fullspeed\",1", NULL);
 #endif
@@ -4628,20 +5484,27 @@ __get_ql_product:
         sleep(1);
     at_response_free(p_response);
     p_response = NULL;
-   
+
     if (isRadioOn() > 0) {
 #if 1 //quectel
-        if ((currentState() == RADIO_STATE_SIM_READY) && (getSIMStatus() == SIM_READY)) {//maybe only usb disconnect
+        if (s_recovery_mode && (currentState() == RADIO_STATE_SIM_READY)) {//maybe only usb disconnect
+            if (getSIMStatus() == SIM_READY)
+                onSIMReady();
+            else
+                setRadioState (RADIO_STATE_SIM_NOT_READY);
             RIL_onUnsolicitedResponse (RIL_UNSOL_RESPONSE_RADIO_STATE_CHANGED, NULL, 0);
             RIL_onUnsolicitedResponse (RIL_UNSOL_RESPONSE_VOICE_NETWORK_STATE_CHANGED, NULL, 0);
-            onSIMReady();
+            RIL_onUnsolicitedResponse(RIL_UNSOL_DATA_CALL_LIST_CHANGED, NULL, 0);
         } else {
-            setRadioState (RADIO_STATE_SIM_NOT_READY); 
+            setRadioState (RADIO_STATE_SIM_NOT_READY);
         }
 #else
         setRadioState (RADIO_STATE_SIM_NOT_READY);
 #endif
     }
+    s_recovery_mode = 0;
+
+    RIL_requestTimedCallback(initializeCustomerCallback, NULL, &TIMEVAL_0);
 }
 
 static void waitForClose()
@@ -4651,7 +5514,7 @@ static void waitForClose()
     while (s_closed == 0) {
         pthread_cond_wait(&s_state_cond, &s_state_mutex);
     }
-    
+
     pthread_mutex_unlock(&s_state_mutex);
 }
 
@@ -4662,21 +5525,21 @@ static void waitForClose()
  */
 static void onUnsolicited (const char *s, const char *sms_pdu)
 {
-    char *line = NULL;
+    char *line = strdup(s);
     int err;
+    char *dup_line = line;
 
     /* Ignore unsolicited responses until we're initialized.
      * This is OK because the RIL library will poll for initial state
      */
     if (sState == RADIO_STATE_UNAVAILABLE) {
-        return;
+        goto __free_line;
     }
 
     if (strStartsWith(s, "%CTZV:")) {
         /* TI specific -- NITZ time */
         char *response;
 
-        line = strdup(s);
         at_tok_start(&line);
 
         err = at_tok_nextstr(&line, &response);
@@ -4721,7 +5584,7 @@ static void onUnsolicited (const char *s, const char *sms_pdu)
          */
         /* can't issue AT commands here -- call on main thread */
         RIL_requestTimedCallback (onDataCallListChanged, NULL, NULL);
-    } 
+    }
 #if 1 //quectel
     else if(strStartsWith(s,"+CTZE:")) { //NITZ
         //+CTZE: "+32",0,"2014/05/05,05:05:30"
@@ -4731,18 +5594,17 @@ static void onUnsolicited (const char *s, const char *sms_pdu)
         char *n_time = NULL;
         char *response = NULL;
 
-        line = strdup(s);
         at_tok_start(&line);
         err = at_tok_nextstr(&line,&tz);
-        if (err < 0) return;
+        if (err < 0) goto __free_line;
         err = at_tok_nextint(&line,&dt);
-        if (err < 0) return;
+        if (err < 0) goto __free_line;
         err = at_tok_nextstr(&line,&n_time);
-        if (err < 0) return;
+        if (err < 0) goto __free_line;
 
         if (n_time[4] == '/')
             asprintf(&response,"%s%s,%d",n_time+2,tz,dt); //2014 -> 14
-        else    
+        else
             asprintf(&response,"%s%s,%d",n_time,tz,dt);
         time_zone_report = 1;
 
@@ -4750,32 +5612,72 @@ static void onUnsolicited (const char *s, const char *sms_pdu)
     } else if (strStartsWith(s, "+CMTI:")) {
         char *memory = NULL;
         int index;
-        line = strdup(s);
         at_tok_start(&line);
         err = at_tok_nextstr(&line,&memory);
-        if (err < 0) return;
+        if (err < 0) goto __free_line;
         if(!strcmp("SM",memory))
         {
             err = at_tok_nextint(&line,&index);
-            if (err < 0) return;
+            if (err < 0) goto __free_line;
              RIL_onUnsolicitedResponse (RIL_UNSOL_RESPONSE_NEW_SMS_ON_SIM,&index, sizeof(int *));
         }
+    } else if (strStartsWith(s, "^HCMT:")) {
+        unsigned char pdu_buf[512];
+        int pdu_len;
+        RIL_CDMA_SMS_Message rcsm;
+
+        pdu_len = hexStringToBytes(sms_pdu, pdu_buf);
+        LOGD("pdu_len = %d", pdu_len);
+        LOGD("sms_pdu = %s", sms_pdu);
+        if (strlen(sms_pdu) > 4 && QL_RIL_CDMASMS_sDecodePDUP2P(0, &rcsm, pdu_buf, pdu_len))
+        {
+            char tmp[1024];
+            int i;
+            LOGD("uTeleserviceID: %d", rcsm.uTeleserviceID);
+            LOGD("bIsServicePresent: %d", rcsm.bIsServicePresent);
+            LOGD("uServicecategory: %d", rcsm.uServicecategory);
+
+            LOGD("sAddress.digit_mode: %d", rcsm.sAddress.digit_mode);
+            LOGD("sAddress.number_mode: %d", rcsm.sAddress.number_mode);
+            LOGD("sAddress.number_type: %d", rcsm.sAddress.number_type);
+            LOGD("sAddress.number_plan: %d", rcsm.sAddress.number_plan);
+            LOGD("sAddress.number_of_digits: %d", rcsm.sAddress.number_of_digits);
+            for (i = 0; i < rcsm.sAddress.number_of_digits; i++)
+                sprintf(&tmp[i*3], "%02x ", rcsm.sAddress.digits[i]);
+            LOGD("sAddress.digits: %s", tmp);
+
+            LOGD("sSubAddress.subaddressType: %d", rcsm.sSubAddress.subaddressType);
+            LOGD("sSubAddress.odd: %d", rcsm.sSubAddress.odd);
+            LOGD("sSubAddress.number_of_digits: %d", rcsm.sSubAddress.number_of_digits);
+            for (i = 0; i < rcsm.sSubAddress.number_of_digits; i++)
+                sprintf(&tmp[i*3], "%02x ", rcsm.sSubAddress.digits[i]);
+            LOGD("sSubAddress.digits: %s", tmp);
+
+            LOGD("uBearerDataLen: %d", rcsm.uBearerDataLen);
+            for (i = 0; i < rcsm.uBearerDataLen; i++)
+                sprintf(&tmp[i*3], "%02x ", rcsm.aBearerData[i]);
+            LOGD("aBearerData: %s", tmp);
+
+             RIL_onUnsolicitedResponse (RIL_UNSOL_RESPONSE_CDMA_NEW_SMS, &rcsm, sizeof(rcsm));
+        }
+    } else if (strstr(s, "POWERED DOWN")) {
+        if (wait_for_powerdown == 1)
+            wait_for_powerdown = 2;
     } else if (strStartsWith(s, "+QIND: \"smsfull\"")) {
         char *memory = NULL;
         char *tmp = NULL;
-        line = strdup(s);
         at_tok_start(&line);
         err = at_tok_nextstr(&line,&tmp);
-        if (err < 0) return;
+        if (err < 0) goto __free_line;
         err = at_tok_nextstr(&line,&memory);
-        if (err < 0) return;
+        if (err < 0) goto __free_line;
         if(!strcmp("SM",memory))
         {
              RIL_onUnsolicitedResponse (RIL_UNSOL_SIM_SMS_STORAGE_FULL,NULL,0);
         }
-#if 1 // RIL will get sim state by pollSIMState() 
+#if 1 // RIL will get sim state by pollSIMState()
     } else if (strStartsWith(s, "+CPIN: READY") || strStartsWith(s, "+QUSIM:") || strStartsWith(s, "+QIND: SMS DONE") || strStartsWith(s, "+QIND: PB DONE")) {
-        if (currentState() == RADIO_STATE_SIM_LOCKED_OR_ABSENT) 
+        if (currentState() == RADIO_STATE_SIM_LOCKED_OR_ABSENT)
             RIL_requestTimedCallback (onSIMStateChange, NULL, NULL); //setRadioState(RADIO_STATE_SIM_READY); //cannot call at_send_command() here, because they are in same thread
 #endif
     } else if (strStartsWith(s, "+CPIN: NOT READY")) {
@@ -4790,26 +5692,25 @@ static void onUnsolicited (const char *s, const char *sms_pdu)
         int err;
 
         ussd_pending_index++;
-        line = strdup(s);
         at_tok_start(&line);
         err = at_tok_nextstr(&line,&mode);
         if(err != 0)
         {
             LOGE("at_tok_nextstr[mode] error");
-            return ;
+            goto __free_line;
         }
         err = at_tok_nextstr(&line,&data);
         if(err != 0)
         {
             LOGE("at_tok_nextstr[data] error");
             onUssdResponse(mode);
-            return ;
+            goto __free_line;
         }
         err = at_tok_nextint(&line,&dcs);
         if(err != 0)
         {
             LOGE("at_tok_nextstr[dcs] error");
-            return ;
+            goto __free_line ;
         }
         dcs &= 0x0c;
 
@@ -4828,10 +5729,10 @@ static void onUnsolicited (const char *s, const char *sms_pdu)
             size_t i = 0;
             unsigned char tmp[512];
             while(i < strlen(data))
-            {   
+            {
                 tmp[i/2] = (unsigned char)gsm_hex2_to_byte(&data[i]);
                 i += 2;
-            }   
+            }
             outlen = ucs2_to_utf8(tmp,i/4,(bytes_t)response[1]);
             response[1][outlen] = 0;
             //free(tmp);
@@ -4848,15 +5749,26 @@ static void onUnsolicited (const char *s, const char *sms_pdu)
             outlen = utf8_from_gsm8((cbytes_t)data,strlen(data),(bytes_t)response[1]);
         }
 #endif
-        LOGI("len:%d response[0]:%s",strlen(response[0]),response[0]);
-        LOGI("len:%d[%d] response[1]:%s",strlen(response[1]),outlen,response[1]);
+        LOGI("len:%zd response[0]:%s",strlen(response[0]),response[0]);
+        LOGI("len:%zd[%d] response[1]:%s",strlen(response[1]),outlen,response[1]);
 
         RIL_onUnsolicitedResponse(RIL_UNSOL_ON_USSD, response, sizeof(response[0]) + sizeof(response[1]));
 
         free(response[0]);
         free(response[1]);
-    } 
+    } else if (strStartsWith(s, "+QDATAFWD:")) {
+        at_tok_start(&line);
+        char *fwd_data = NULL;
+        err = at_tok_nextstr(&line, &fwd_data);
+        if (err < 0) {
+            LOGE("parse fwd_data error\n");
+            goto __free_line;
+        }
+        ql_fwdsvc_recv_data(fwd_data);
+    }
 #endif
+__free_line:
+    free(dup_line);
 }
 
 /* Called on command or reader thread */
@@ -4865,23 +5777,34 @@ static void onATReaderClosed()
     LOGI("AT channel closed\n");
     at_close();
     s_closed = 1;
+    s_recovery_mode = 0;
+
+    if (s_recovery_mode == 0) {
+        RIL_onUnsolicitedResponse (RIL_UNSOL_RESPONSE_SIM_STATUS_CHANGED, NULL, 0); //clean SIMRecords.java info
+    }
 
 #if 1 //quectel
+    if (wait_for_powerdown) {
+        wait_for_powerdown = 3;
+        sleep(60);
+    }
+    bSetupDataCallCompelete = 0;
     setDataServiceState(0);
     if (!strncmp(PPP_TTY_PATH, "ppp", 3))
-        ql_kill_pppd(SIGKILL);
+        ql_pppd_stop(SIGKILL);
     else
-        ql_kill_ndis(SIGKILL);
-#ifdef QUECTEL_DEBUG //quectel //for debug-purpose, record logcat msg to file
+        ql_ndis_stop(SIGKILL);
+#if 1 //def QUECTEL_DEBUG //quectel //for debug-purpose, record logcat msg to file
     log_dmesg("onATReaderClosed");
 #endif
-    if (currentState() == RADIO_STATE_SIM_READY) {//maybe only usb disconnect
+    if (s_recovery_mode && currentState() == RADIO_STATE_SIM_READY) {//maybe only usb disconnect
         pthread_mutex_lock(&s_state_mutex);
         pthread_cond_broadcast (&s_state_cond);
         pthread_mutex_unlock(&s_state_mutex);
-        return;   
-    } 
+        return;
+    }
 #endif
+
     setRadioState (RADIO_STATE_UNAVAILABLE);
 }
 
@@ -4892,6 +5815,7 @@ static void onATTimeout()
     at_close();
 
     s_closed = 1;
+    s_recovery_mode = 1;
 
     /* FIXME cause a radio reset here */
 
@@ -4913,7 +5837,7 @@ static void usage(char *s)
 
 static void clean_up_child_process(int signal_num) {
     /* clean up child process */
-    while(waitpid(-1, NULL, WNOHANG) > 0); 
+    while(waitpid(-1, NULL, WNOHANG) > 0);
 }
 
 static void *
@@ -4922,25 +5846,31 @@ mainLoop(void *param)
     int fd;
     int ret;
 
-#ifdef QUECTEL_DEBUG //quectel //for debug-purpose, record logcat msg to file
+#ifdef QUECTEL_DEBUG
+    if (access("/data/ql_log", W_OK) && errno == ENOENT) {
+        system("/system/bin/mkdir /data/ql_log");
+    }
+#endif
+
+#if 1 //def QUECTEL_DEBUG //quectel //for debug-purpose, record logcat msg to file
 //you can fetch logfiles to host-pc by adb tools using command "adb pull /data/ql_log/"
-    char logcat_cmd[100];
-    time_t rawtime;
-    struct tm *timeinfo;	
-    time(&rawtime);
-    timeinfo=localtime(&rawtime );
-    system("/system/bin/mkdir /data/ql_log");
-    sprintf(logcat_cmd, "/system/bin/logcat -v time -f /data/ql_log/%02d%02d_%02d%02d%02d_logcat.txt &",
-		timeinfo->tm_mon+1, timeinfo->tm_mday, timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
-    system(logcat_cmd);
-    sprintf(logcat_cmd, "/system/bin/logcat -b radio -v time -f /data/ql_log/%02d%02d_%02d%02d%02d_radio.txt &",
-		timeinfo->tm_mon+1, timeinfo->tm_mday, timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
-    system(logcat_cmd);
+    if (access("/data/ql_log", W_OK) == 0) {
+        char logcat_cmd[100];
+        time_t rawtime;
+        struct tm *timeinfo;	
+        time(&rawtime);
+        timeinfo=localtime(&rawtime );
+        sprintf(logcat_cmd, "/system/bin/logcat -v time -f /data/ql_log/%02d%02d_%02d%02d%02d_logcat.txt &",
+    		timeinfo->tm_mon+1, timeinfo->tm_mday, timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
+        system(logcat_cmd);
+        sprintf(logcat_cmd, "/system/bin/logcat -b radio -v time -f /data/ql_log/%02d%02d_%02d%02d%02d_radio.txt &",
+    		timeinfo->tm_mon+1, timeinfo->tm_mday, timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
+        system(logcat_cmd);
+    }
 #endif
 
     signal(SIGCHLD, clean_up_child_process); //becasue use fork() to start and stop pppd
-    LOGD("Quectel RIL Version: " REFERENCE_RIL_VERSION);
-    LOGI("mainLoop Start\r\n");
+    LOGI("mainLoop Start");
     AT_DUMP("== ", "entering mainLoop()", -1 );
     at_set_on_reader_closed(onATReaderClosed);
     at_set_on_timeout(onATTimeout);
@@ -4958,8 +5888,8 @@ mainLoop(void *param)
         if (gsm0710muxd(s_device_path, cmux_speed, cmux_ctsrts)) {
             sleep(3);
             continue;
-            }
-    } else { 
+        }
+    } else {
         if (s_device_path == ql_ttyAT) {
             char atdevice[10];
             if (!ql_get_ttyAT(atdevice)) {
@@ -4970,9 +5900,9 @@ mainLoop(void *param)
             LOGD("quectel at port is %s", ql_ttyAT);
         }
     }
-#ifdef QUECTEL_DEBUG //quectel //for debug-purpose, record logcat msg to file
+#if 1//def QUECTEL_DEBUG //quectel //for debug-purpose, record logcat msg to file
         log_dmesg("mainLoop");
-#endif        
+#endif
 
         fd = -1;
         while  (fd < 0) {
@@ -5026,6 +5956,7 @@ mainLoop(void *param)
         sleep(1);
 
         waitForClose();
+        sleep(1); //wait for other threads clean
         LOGI("Re-opening after close");
     }
 }
@@ -5040,32 +5971,74 @@ const RIL_RadioFunctions *RIL_Init(const struct RIL_Env *env, int argc, char **a
     int fd = -1;
     int opt;
     pthread_attr_t attr;
+    struct passwd *pwd;
 
-    char version_str[PROPERTY_VALUE_MAX] = {'\0'};
-    int version = 0xffff;
-    int ril_version = -1;
-    if (property_get("ro.build.version.release", version_str, NULL) > 0) {
-        version = (version_str[0] - '0') * 10 + (version_str[2] - '0');
+    char prop_value[PROPERTY_VALUE_MAX] = {'\0'};
+    int anroid_version = 255;
+
+    pwd = getpwuid(getuid());
+    if (strcmp(pwd->pw_name, "root")) {
+        LOGE("Error: the USER of service ril-daemon is %s, it should be root. Pls follow RIL document to comment rild.c/switchUser", pwd->pw_name);
     }
-    LOGD("[ro.build.version.release]: [%s]", version_str); 
-    if (version <= 40)
-        ril_version = 6;
-    else if (version == 41)
-        ril_version = 6;
-    else if (version == 42)
-        ril_version = 7;
-    else if (version == 43)
-        ril_version = 8;
-    else if (version == 44)
-        ril_version = 9;
-    else if (version == 50)
-        ril_version = 10;
-    else if (version == 51)
-        ril_version = 11;
-    else 
-        LOGE("Unsupport Android Version by Quectel Now!!!!");
-    LOGD("Android Version: %d, RIL_VERSION: %d / %d", version, ril_version, RIL_VERSION);
-    //s_callbacks.version = RIL_VERSION;
+
+    LOGD("Quectel RIL Version: " REFERENCE_RIL_VERSION);
+
+#ifdef USE_NDK
+    ql_ndk_init();
+#endif
+
+    if (property_get("ro.build.version.release", prop_value, NULL) > 0) {
+        anroid_version = (prop_value[0] - '0') * 10 + (prop_value[2] - '0');
+    }
+    LOGD("[ro.build.version.release]: [%s]", prop_value);
+    if (anroid_version <= 40) QL_RIL_VERSION = 6;
+    else if (anroid_version == 41) QL_RIL_VERSION = 6;
+    else if (anroid_version == 42) QL_RIL_VERSION = 7;
+    else if (anroid_version == 43) QL_RIL_VERSION = 8;
+    else if (anroid_version == 44) QL_RIL_VERSION = 9;
+    else if (anroid_version == 50) QL_RIL_VERSION = 10;
+    else if (anroid_version == 51) QL_RIL_VERSION = 11;
+    else if (anroid_version == 60) QL_RIL_VERSION = 11;
+    else LOGE("Unsupport Android Version %d by Quectel Now!!!!", anroid_version);
+    LOGD("Android Version: %d, RIL_VERSION: %d / %d", anroid_version, QL_RIL_VERSION, RIL_VERSION);
+    s_callbacks.version = QL_RIL_VERSION;
+    if (property_get("ro.build.description", prop_value, NULL) > 0) {
+        LOGD("[ro.build.description]: [%s]", prop_value);
+    }
+    if (property_get("rild.libpath", prop_value, NULL) > 0) {
+        LOGD("[rild.libpath]: [%s]", prop_value);
+    }
+    if (property_get("rild.libargs", prop_value, NULL) > 0) {
+        LOGD("[rild.libargs]: [%s]", prop_value);
+    }
+
+    if ((QL_RIL_VERSION > 9) && access("/sys/fs/selinux", F_OK) == 0) {
+        /* SELinux is not compiled into the kernel, or has been disabled via the kernel command line "selinux=0". */
+        LOGD("selinux maybe set Enforcing mode, use command getenforce to check");
+        LOGD("selinux maybe set Enforcing mode, use command \"setenforce 0\" to disable");
+        /* append next selinux rulers to external/sepolicy/file_contexts
+        # Quectel RIL
+        /dev/ttyUSB[0-9]       u:object_r:tty_device:s0
+        /dev/ttyACM[0-9]       u:object_r:tty_device:s0
+        */
+         /* append next selinux rulers to external/sepolicy/rild.te
+        # Quectel RIL
+        allow rild logd:unix_stream_socket connectto;
+        allow rild logdr_socket:sock_file write;
+        allow rild ppp_device:chr_file { read write ioctl open };
+        allow rild ppp_exec:file { read execute open execute_no_trans };
+        allow rild self:capability { sys_module setgid dac_override };
+        allow rild self:capability2 { syslog };
+        allow rild kernel:system { syslog_read syslog_mod };
+        allow rild system_data_file:dir {create write add_name};
+        allow rild system_data_file:file { write create append };
+        allow rild system_data_file:lnk_file create;
+        allow rild tmpfs:lnk_file read;
+        allow rild devpts:chr_file { write read ioctl open getattr };
+        */
+    }
+
+    property_set("telephony.lteOnCdmaDevice", "0");  // "1" will make PhoneFactory.java create CDMALTEPhone
 
     s_rilenv = env;
 
@@ -5105,10 +6078,72 @@ const RIL_RadioFunctions *RIL_Init(const struct RIL_Env *env, int argc, char **a
                 cmux_speed = atoi(optarg);
                 LOGI("cmux_speed = %d\n", cmux_speed);
             break;
-              
+
             default:
                 usage(argv[0]);
                 return NULL;
+        }
+    }
+
+    if (s_device_path != NULL) {
+        LOGD("you designate %s as AT port", s_device_path);
+        if (access(s_device_path, R_OK)) {
+            LOGD("but it does not exist, access device %s error for %s\n", s_device_path, strerror(errno));
+            LOGD("if you access module by UART interface, this error ususally means critical mistake!");
+            LOGD("if you access module by USB interface, i will ingore it, for Quectel RIL will auto detect AT and PPP ports");
+            s_device_path = NULL;
+        } else {
+            char filename[255];
+            char linkname[255];
+            int filenamesize;
+            sprintf(filename, "/sys/class/tty/%s", &s_device_path[strlen("/dev/")]);
+            filenamesize = readlink(filename, linkname, sizeof(linkname)-1);
+            if (filenamesize > 0) {
+                linkname[filenamesize] = 0;
+                if (strstr(linkname, "/usb")) {
+                    LOGD("i guess you designate a usb port as AT port");
+                    if (strstr(linkname, "/tty")) {
+                        char idVendor[] = "0000";
+                        char idProduct[] = "0000";
+                        int fd;
+                        *(strstr(linkname, "/tty")) = '\0';
+                        sprintf(filename, "/sys/class/tty/%s/../idVendor", linkname);
+                        fd = open(filename, O_RDONLY);
+                        if (fd > 0) {
+                            read(fd, idVendor, 4);
+                            close(fd);
+                        }
+                        sprintf(filename, "/sys/class/tty/%s/../idProduct", linkname);
+                        fd = open(filename, O_RDONLY);
+                        if (fd > 0) {
+                            read(fd, idProduct, 4);
+                            close(fd);
+                        }
+                        LOGD("and the usb devices's idVendor = %s, idProduct = %s", idVendor, idProduct);
+                        if (!strncasecmp(idVendor, "05c6", 4)
+                            && (!strncasecmp(idProduct, "9090", 4) || !strncasecmp(idProduct, "9003", 4) || !strncasecmp(idProduct, "9215", 4) || 
+								!strncasecmp(idProduct, "9025", 4))) {
+                            LOGD("i will ingore it, for Quectel RIL will auto detect AT and PPP ports");
+                            s_device_path = NULL;
+                        } else if (!strncasecmp(idVendor, "1519", 4)
+                            && (!strncasecmp(idProduct, "0331", 4) || !strncasecmp(idProduct, "0020", 4) || !strncasecmp(idProduct, "9215", 4))) {
+                            LOGD("i will ingore it, for Quectel RIL will auto detect AT and PPP ports");
+                            s_device_path = NULL;
+                        } else if (!strncasecmp(idVendor, "2c7c", 4)
+                            && (!strncasecmp(idProduct, "0125", 4) || !strncasecmp(idProduct, "0121", 4))) {
+                            LOGD("i will ingore it, for Quectel RIL will auto detect AT and PPP ports");
+                            s_device_path = NULL;
+                        }
+                    }else {
+
+                    }
+                } else {
+                    LOGD("i guess you designate a physical port as AT port, and you maybe use quectel GSM modules");
+                }
+            } else {
+                LOGD("readlink %s errno: %d (%s)", filename, errno, strerror(errno));
+                LOGD("i guess you donot designate a tty port as AT port, ususally means critical mistake!");
+            }
         }
     }
 
@@ -5122,7 +6157,9 @@ const RIL_RadioFunctions *RIL_Init(const struct RIL_Env *env, int argc, char **a
     }
 
     if (s_device_path != ql_ttyAT) {
+#ifdef USE_MUXD
         ql_mux_enabled = 1;
+#endif
         if (strStartsWith(s_device_path, "/dev/ttyUSB")) {
             if (atoi(&s_device_path[strlen("/dev/ttyUSB")]) > 1)
                 ql_mux_enabled = 0;
