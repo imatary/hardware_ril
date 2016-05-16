@@ -37,7 +37,7 @@
 
 #ifdef HAVE_ANDROID_OS
 /* for IOCTL's */
-#include <linux/omap_csmi.h>
+//#include <linux/omap_csmi.h>
 #endif /*HAVE_ANDROID_OS*/
 
 #include "misc.h"
@@ -472,7 +472,7 @@ static void *readerLoop(void *arg)
             processLine(line);
         }
 
-#ifdef HAVE_ANDROID_OS
+#if 0 //def HAVE_ANDROID_OS
         if (s_ackPowerIoctl > 0) {
             /* acknowledge that bytes have been read and processed */
             ioctl(s_fd, OMAP_CSMI_TTY_ACK, &s_readCount);
