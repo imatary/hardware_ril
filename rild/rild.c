@@ -31,21 +31,24 @@
 #include <cutils/sockets.h>
 #include <sys/capability.h>
 #include <linux/prctl.h>
-
+#include <sys/ioctl.h>
 #include <private/android_filesystem_config.h>
 #include "hardware/qemu_pipe.h"
-#include <runtime/runtime.h>
 
 #define LIB_PATH_PROPERTY   "rild.libpath"
 #define LIB_ARGS_PROPERTY   "rild.libargs"
+#define MODEM_DEV_PATH	  "/dev/voice_modem"
 #define MAX_LIB_ARGS        16
-#define MAX_POLL_DEVICE_CNT 160
-#define REFERENCE_RIL_DEF_PATH "/system/lib/libreference-ril.so"
-#define REFERENCE_RIL_ZTE_PATH "/system/lib/libreference-ril-zte.so"
-#define REFERENCE_RIL_MC9090_AT_PATH "/system/lib/libsierraat-ril.so"
-#define REFERENCE_RIL_MC9090_QMI_PATH "/system/lib/libsierra-ril.so"
-#define REFERENCE_RIL_MC9090_HL_PATH "/system/lib/libsierrahl-ril.so"
-#define MC9090_PROP_NAME "mc9090.work_type"
+#define BP_IOCTL_BASE 0x1a
+
+#define BP_IOCTL_RESET 		_IOW(BP_IOCTL_BASE, 0x01, int)
+#define BP_IOCTL_POWOFF 	_IOW(BP_IOCTL_BASE, 0x02, int)
+#define BP_IOCTL_POWON 		_IOW(BP_IOCTL_BASE, 0x03, int)
+
+#define BP_IOCTL_WRITE_STATUS 	_IOW(BP_IOCTL_BASE, 0x04, int)
+#define BP_IOCTL_GET_STATUS 	_IOR(BP_IOCTL_BASE, 0x05, int)
+#define BP_IOCTL_SET_PVID 	_IOW(BP_IOCTL_BASE, 0x06, int)
+#define BP_IOCTL_GET_BPID 	_IOR(BP_IOCTL_BASE, 0x07, int)
 static void usage(const char *argv0)
 {
     fprintf(stderr, "Usage: %s -l <ril impl library> [-- <args for impl library>]\n", argv0);
@@ -69,7 +72,6 @@ static struct RIL_Env s_rilEnv = {
     RIL_onUnsolicitedResponse,
     RIL_requestTimedCallback
 };
-static int s_poll_device_cnt = 0;
 
 extern void RIL_startEventLoop();
 
@@ -104,7 +106,37 @@ void switchUser() {
     cap.inheritable = 0;
     capset(&header, &cap);
 }
-
+int getBpID(){
+	int bp_fd = -1;
+	int biID =-1;
+	int err = -1;
+	bp_fd = open(MODEM_DEV_PATH, O_RDWR);
+	if(bp_fd > 0){		
+		err = ioctl(bp_fd,BP_IOCTL_GET_BPID,&biID);
+		if(err < 0){
+			RLOGE("biID=%d getBpID failed  ioctrl err =%d bp_fd=%d",biID,err,bp_fd);
+			close(bp_fd);
+			return -1;
+		}else{
+			RLOGD("biID=%d getBpID sucessed",biID);
+			close(bp_fd);
+			return biID;
+		} 
+	}
+	RLOGE("biID=%d getBpID failed bp_fd = ",biID,bp_fd);
+	return -1;	
+}
+void startmux(int bp_id){
+	char *muxbin =NULL;
+	if(bp_id < 0){
+		RLOGE("bp_id=%d cann`t found mux bin to start",bp_id);
+	}else{
+		asprintf(&muxbin, "muxd%d",bp_id); 
+		property_set("ctl.start",muxbin); 
+		RLOGD("bp_id=%d found %s to start",bp_id,muxbin);
+		free(muxbin);
+	}
+}
 int main(int argc, char **argv)
 {
     const char * rilLibPath = NULL;
@@ -113,11 +145,11 @@ int main(int argc, char **argv)
     const RIL_RadioFunctions *(*rilInit)(const struct RIL_Env *, int, char **);
     const RIL_RadioFunctions *funcs;
     char libPath[PROPERTY_VALUE_MAX];
-	char workType[PROPERTY_VALUE_MAX];
     unsigned char hasLibArgs = 0;
-    int modem_type = UNKNOWN_MODEM;
-    int i;
 
+    int i;
+	int bpID = -1;
+	char *rilLibPathTemp = NULL;
     umask(S_IRGRP | S_IWGRP | S_IXGRP | S_IROTH | S_IWOTH | S_IXOTH);
     for (i = 1; i < argc ;) {
         if (0 == strcmp(argv[i], "-l") && (argc - i > 1)) {
@@ -132,61 +164,35 @@ int main(int argc, char **argv)
         }
     }
 
-    //Wait for device ready.
-    if (1/*rilLibPath == NULL*/) {
-		while(UNKNOWN_MODEM == modem_type){
-		    modem_type = runtime_3g_port_type();
-		    ALOGD("Couldn't find proper modem, retrying...%d", modem_type);
-		    s_poll_device_cnt++;
-		    if (s_poll_device_cnt > MAX_POLL_DEVICE_CNT){
-				/*
-				*Maybe no device right now, start to monitor
-				*hotplug event later.
-				*/
-				//start_uevent_monitor();
-				//goto done;
-				break;
-		    }
-		    sleep(1);
-		}
-    }
-
-    start_uevent_monitor();
-
-    switch (modem_type){
-		case ZTE_MODEM:
-		rilLibPath = REFERENCE_RIL_ZTE_PATH;
-		break;
-		case MC9090_MODEM:
-		workType[0] = '\0';
-		property_get(MC9090_PROP_NAME, workType, "at");
-
-		if (!strcmp(workType, "qmi"))
-			rilLibPath = REFERENCE_RIL_MC9090_QMI_PATH;
-		else if (!strcmp(workType, "hl"))
-			rilLibPath = REFERENCE_RIL_MC9090_QMI_PATH;			
-		else
-			rilLibPath = REFERENCE_RIL_MC9090_AT_PATH;
-		RLOGE("ril worktype =%s\n", workType);
-		break;
-		case HUAWEI_MODEM:
-		case AMAZON_MODEM:
-		default:
-			if (!rilLibPath)
-				rilLibPath = REFERENCE_RIL_DEF_PATH;
-		break;
-    }
-	RLOGE("ril lib path=%s\n", rilLibPath);
     if (rilLibPath == NULL) {
-        if ( 0 == property_get(LIB_PATH_PROPERTY, libPath, NULL)) {
-            // No lib sepcified on the command line, and nothing set in props.
-            // Assume "no-ril" case.
-            goto done;
-        } else {
-            rilLibPath = libPath;
-        }
+	  bpID = getBpID();
+	  if(bpID < 0){
+		if ( 0 == property_get(LIB_PATH_PROPERTY, libPath, NULL)) {
+            	// No lib sepcified on the command line, and nothing set in props.
+            	// Assume "no-ril" case.
+            		rilLibPath = "/system/lib/libril-rk29-dataonly.so";
+					//system("stop ril-daemon3");
+            		//goto done;
+        	} else {
+            		rilLibPath = libPath;
+        	}
+	  }else{	  	
+		asprintf(&rilLibPathTemp, "%s%d",LIB_PATH_PROPERTY,bpID); 
+		if ( 0 == property_get(rilLibPathTemp, libPath, NULL)) {
+            	// No lib sepcified on the command line, and nothing set in props.
+            	// Assume "no-ril" case.
+            		free(rilLibPathTemp);
+				    rilLibPath = "/system/lib/libril-rk29-dataonly.so";
+            		//goto done;
+        	} else {
+        		RLOGD("rilLibPathTemp=%s found %s to install",rilLibPathTemp,libPath);
+        		free(rilLibPathTemp);
+            		rilLibPath = libPath;
+        	}
+	  }
+        
     }
-
+    startmux(bpID);
     /* special override when in the emulator */
 #if 1
     {
@@ -294,9 +300,8 @@ int main(int argc, char **argv)
     }
 OpenLib:
 #endif
-#ifndef MODEM_EC20
-    switchUser();
-#endif
+   // switchUser();
+
     dlHandle = dlopen(rilLibPath, RTLD_NOW);
 
     if (dlHandle == NULL) {
@@ -323,25 +328,10 @@ OpenLib:
         property_get(LIB_ARGS_PROPERTY, args, "");
         argc = make_argv(args, rilArgv);
     }
-	if (modem_type == MC9090_MODEM){
-		argc = 4;
-		if (!strcmp(workType, "qmi")){
-			rilArgv[1] = "-a";
-			rilArgv[2] = "-i";
-			rilArgv[3] = "usb0";
-		}else{
-			rilArgv[1] = "-a";
-			rilArgv[2] = "-i";
-			rilArgv[3] = "wwan0";
-		}
-	}
+
     // Make sure there's a reasonable argv[0]
     rilArgv[0] = argv[0];
-    {
-	int c = 0;
-	for (c = 0; c < argc; c++)
-	    RLOGE("arg%d: %s\n", c, rilArgv[c]);
-    }
+
     funcs = rilInit(&s_rilEnv, argc, rilArgv);
 
     RIL_register(funcs);

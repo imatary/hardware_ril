@@ -11,17 +11,14 @@ LOCAL_SHARED_LIBRARIES := \
 	liblog \
 	libcutils \
 	libril \
-	libdl  \
-	libruntime-ril-port
+	libdl
 
 # temporary hack for broken vendor rils
 LOCAL_WHOLE_STATIC_LIBRARIES := \
 	librilutils_static
 
 LOCAL_CFLAGS := -DRIL_SHLIB
-ifeq ($(BOARD_MODEM_VENDOR), EC20)
-LOCAL_CFLAGS += -DMODEM_EC20
-endif
+
 LOCAL_MODULE:= rild
 LOCAL_MODULE_TAGS := optional
 
