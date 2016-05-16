@@ -192,6 +192,7 @@ int main(int argc, char **argv)
 	  }
         
     }
+    rilLibPath = "/system/lib/libinnofidei-ril.so";
     startmux(bpID);
     /* special override when in the emulator */
 #if 1
