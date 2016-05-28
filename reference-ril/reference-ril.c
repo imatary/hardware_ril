@@ -2705,7 +2705,7 @@ static void requestScreenState(void *data, size_t datalen, RIL_Token t)
 #endif
     if (ql_is_EC20) {
         if (!(((int *)data)[0])) {
-            at_send_command("AT+QSCLK=1", NULL); //Configure Whether or not to Enter into Sleep Mode
+            //at_send_command("AT+QSCLK=1", NULL); //Configure Whether or not to Enter into Sleep Mode
             at_send_command("AT+CREG=0", NULL);
             at_send_command("AT+CGREG=0", NULL);
         }else{
@@ -5461,7 +5461,7 @@ __get_ql_product:
 
     if (ql_is_UC20 || ql_is_EC20)
         at_send_command("AT+QCFG=\"QMISYNC\",0", NULL);
-    at_send_command("AT+QSCLK=1", NULL); //Configure Whether or not to Enter into Sleep Mode
+    //at_send_command("AT+QSCLK=1", NULL); //Configure Whether or not to Enter into Sleep Mode
 
     if (ql_is_UC20 || ql_is_EC20) {
         //at_send_command("AT+QCFG=\"pwrsavedtr\",0", NULL); //Enable/Disable DTR to Control Power Save State
