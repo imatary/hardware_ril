@@ -2684,6 +2684,28 @@ error:
  *  Add new function to handle more requests.
  *  Must response to RIL.JAVA.
  */
+static int Ec20CanSleep(void)
+{
+	int err;
+	int n = 0;
+
+	char *line = NULL;
+	ATResponse *atResponse = NULL;
+
+	err = at_send_command_singleline("AT+QSCLK?","+QSCLK:",&atResponse);
+	if (err != 0) return 0;
+
+	line = atResponse->p_intermediates->line;
+	err = at_tok_start(&line);
+	if (err < 0) return 0;
+
+	err = at_tok_nextint(&line,&n);
+	if (err < 0) return 0;
+	LOGE("queryQSCLK=%d\n", n);
+	if (!n)
+		at_send_command("AT+QSCLK=1", NULL);
+	return n;
+}
 
 /*
 * Function: requestScreenState
@@ -2705,7 +2727,7 @@ static void requestScreenState(void *data, size_t datalen, RIL_Token t)
 #endif
     if (ql_is_EC20) {
         if (!(((int *)data)[0])) {
-            //at_send_command("AT+QSCLK=1", NULL); //Configure Whether or not to Enter into Sleep Mode
+            Ec20CanSleep();
             at_send_command("AT+CREG=0", NULL);
             at_send_command("AT+CGREG=0", NULL);
         }else{
@@ -5461,7 +5483,7 @@ __get_ql_product:
 
     if (ql_is_UC20 || ql_is_EC20)
         at_send_command("AT+QCFG=\"QMISYNC\",0", NULL);
-    //at_send_command("AT+QSCLK=1", NULL); //Configure Whether or not to Enter into Sleep Mode
+    at_send_command("AT+QSCLK=1", NULL); //Configure Whether or not to Enter into Sleep Mode
 
     if (ql_is_UC20 || ql_is_EC20) {
         //at_send_command("AT+QCFG=\"pwrsavedtr\",0", NULL); //Enable/Disable DTR to Control Power Save State
