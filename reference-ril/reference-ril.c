@@ -2688,7 +2688,7 @@ static int Ec20CanSleep(void)
 {
 	int err;
 	int n = 0;
-
+#if 0
 	char *line = NULL;
 	ATResponse *atResponse = NULL;
 
@@ -2702,6 +2702,7 @@ static int Ec20CanSleep(void)
 	err = at_tok_nextint(&line,&n);
 	if (err < 0) return 0;
 	LOGE("queryQSCLK=%d\n", n);
+#endif
 	if (!n)
 		at_send_command("AT+QSCLK=1", NULL);
 	return n;
