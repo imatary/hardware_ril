@@ -190,6 +190,9 @@ qmi_name_item(QMINAS_GET_PLMN_NAME_REQ), //                0x0044
 qmi_name_item(QMINAS_GET_PLMN_NAME_RESP), //               0x0044
 qmi_name_item(QUECTEL_PACKET_TRANSFER_START_IND), //                0X100
 qmi_name_item(QUECTEL_PACKET_TRANSFER_END_IND), //               0X101
+qmi_name_item(QMINAS_GET_SYS_INFO_REQ), //                 0x004D
+qmi_name_item(QMINAS_GET_SYS_INFO_RESP), //                0x004D
+qmi_name_item(QMINAS_SYS_INFO_IND), //                     0x004D
 };
 
 static const QMI_NAME_T qmux_wms_Type[] = {
@@ -228,6 +231,40 @@ qmi_name_item(QMIWDS_ADMIN_SET_QMAP_SETTINGS_REQ), //    0x002B
 qmi_name_item(QMIWDS_ADMIN_SET_QMAP_SETTINGS_RESP), //   0x002B
 qmi_name_item(QMIWDS_ADMIN_GET_QMAP_SETTINGS_REQ), //    0x002C
 qmi_name_item(QMIWDS_ADMIN_GET_QMAP_SETTINGS_RESP), //   0x002C
+};
+
+static const QMI_NAME_T qmux_uim_Type[] = {
+qmi_name_item( QMIUIM_READ_TRANSPARENT_REQ), //      0x0020
+qmi_name_item( QMIUIM_READ_TRANSPARENT_RESP), //     0x0020
+qmi_name_item( QMIUIM_READ_TRANSPARENT_IND), //      0x0020
+qmi_name_item( QMIUIM_READ_RECORD_REQ), //           0x0021
+qmi_name_item( QMIUIM_READ_RECORD_RESP), //          0x0021
+qmi_name_item( QMIUIM_READ_RECORD_IND), //           0x0021
+qmi_name_item( QMIUIM_WRITE_TRANSPARENT_REQ), //     0x0022
+qmi_name_item( QMIUIM_WRITE_TRANSPARENT_RESP), //    0x0022
+qmi_name_item( QMIUIM_WRITE_TRANSPARENT_IND), //     0x0022
+qmi_name_item( QMIUIM_WRITE_RECORD_REQ), //          0x0023
+qmi_name_item( QMIUIM_WRITE_RECORD_RESP), //         0x0023
+qmi_name_item( QMIUIM_WRITE_RECORD_IND), //          0x0023
+qmi_name_item( QMIUIM_SET_PIN_PROTECTION_REQ), //    0x0025
+qmi_name_item( QMIUIM_SET_PIN_PROTECTION_RESP), //   0x0025
+qmi_name_item( QMIUIM_SET_PIN_PROTECTION_IND), //    0x0025
+qmi_name_item( QMIUIM_VERIFY_PIN_REQ), //            0x0026
+qmi_name_item( QMIUIM_VERIFY_PIN_RESP), //           0x0026
+qmi_name_item( QMIUIM_VERIFY_PIN_IND), //            0x0026
+qmi_name_item( QMIUIM_UNBLOCK_PIN_REQ), //           0x0027
+qmi_name_item( QMIUIM_UNBLOCK_PIN_RESP), //          0x0027
+qmi_name_item( QMIUIM_UNBLOCK_PIN_IND), //           0x0027
+qmi_name_item( QMIUIM_CHANGE_PIN_REQ), //            0x0028
+qmi_name_item( QMIUIM_CHANGE_PIN_RESP), //           0x0028
+qmi_name_item( QMIUIM_CHANGE_PIN_IND), //            0x0028
+qmi_name_item( QMIUIM_DEPERSONALIZATION_REQ), //     0x0029
+qmi_name_item( QMIUIM_DEPERSONALIZATION_RESP), //    0x0029
+qmi_name_item( QMIUIM_EVENT_REG_REQ), //             0x002E
+qmi_name_item( QMIUIM_EVENT_REG_RESP), //            0x002E
+qmi_name_item( QMIUIM_GET_CARD_STATUS_REQ), //       0x002F
+qmi_name_item( QMIUIM_GET_CARD_STATUS_RESP), //      0x002F
+qmi_name_item( QMIUIM_STATUS_CHANGE_IND), //         0x0032
 };
 
 static const char * qmi_name_get(const QMI_NAME_T *table, size_t size, int type, const char *tag) {
@@ -330,6 +367,10 @@ int dump_qmux(QMI_SERVICE_TYPE serviceType, PQCQMUX_HDR QMUXHdr) {
         case QMUX_TYPE_WDS_ADMIN:
             dbg("Type:               %04x\t%s\n", le16_to_cpu(QMUXMsgHdr->Type),
             QMUX_NAME(qmux_wds_admin_Type, le16_to_cpu(QMUXMsgHdr->Type), tag));
+        break;
+        case QMUX_TYPE_UIM:
+            dbg("Type:               %04x\t%s\n", le16_to_cpu(QMUXMsgHdr->Type),
+            QMUX_NAME(qmux_uim_Type, le16_to_cpu(QMUXMsgHdr->Type), tag));
         break;
         case QMUX_TYPE_PDS:
         case QMUX_TYPE_QOS:

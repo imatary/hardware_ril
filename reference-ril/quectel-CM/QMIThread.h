@@ -1,3 +1,6 @@
+#ifndef __QMI_THREAD_H__
+#define __QMI_THREAD_H__
+
 #define CONFIG_GOBINET
 #define CONFIG_QMIWWAN
 #define CONFIG_SIM
@@ -31,6 +34,31 @@
 #include "MPQCTL.h"
 #include "MPQMUX.h"
 
+#define DEVICE_CLASS_UNKNOWN           0
+#define DEVICE_CLASS_CDMA              1
+#define DEVICE_CLASS_GSM               2
+
+#define WWAN_DATA_CLASS_NONE            0x00000000
+#define WWAN_DATA_CLASS_GPRS            0x00000001
+#define WWAN_DATA_CLASS_EDGE            0x00000002 /* EGPRS */
+#define WWAN_DATA_CLASS_UMTS            0x00000004
+#define WWAN_DATA_CLASS_HSDPA           0x00000008
+#define WWAN_DATA_CLASS_HSUPA           0x00000010
+#define WWAN_DATA_CLASS_LTE             0x00000020
+#define WWAN_DATA_CLASS_1XRTT           0x00010000
+#define WWAN_DATA_CLASS_1XEVDO          0x00020000
+#define WWAN_DATA_CLASS_1XEVDO_REVA     0x00040000
+#define WWAN_DATA_CLASS_1XEVDV          0x00080000
+#define WWAN_DATA_CLASS_3XRTT           0x00100000
+#define WWAN_DATA_CLASS_1XEVDO_REVB     0x00200000 /* for future use */
+#define WWAN_DATA_CLASS_UMB             0x00400000
+#define WWAN_DATA_CLASS_CUSTOM          0x80000000
+
+struct wwan_data_class_str {
+    ULONG class;
+    CHAR *str;
+};
+
 #pragma pack(push, 1)
 
 typedef struct _QCQMIMSG {
@@ -49,9 +77,23 @@ typedef struct __IPV4 {
     ULONG SubnetMask;
     ULONG DnsPrimary;
     ULONG DnsSecondary;
+    ULONG Mtu;
 } IPV4_T;
 
+typedef struct __IPV6 {
+    UCHAR Address[16];
+    UCHAR Gateway[16];
+    UCHAR SubnetMask[16];
+    UCHAR DnsPrimary[16];
+    UCHAR DnsSecondary[16];
+    UCHAR PrefixLengthIPAddr;
+    UCHAR PrefixLengthGateway;
+    ULONG Mtu;
+} IPV6_T;
+
 typedef struct __PROFILE {
+    char * qmichannel;
+    char * usbnet_adapter;
     const char *apn;
     const char *user;
     const char *password;
@@ -60,6 +102,8 @@ typedef struct __PROFILE {
     int pdp;
     int IPType;
     int rawIP;
+    IPV4_T ipv4;
+    IPV6_T ipv6;
 } PROFILE_T;
 
 typedef enum {
@@ -89,8 +133,8 @@ extern int QmiWwanSendQMI(PQCQMIMSG pRequest);
 extern void * QmiWwanThread(void *pData);
 extern int GobiNetSendQMI(PQCQMIMSG pRequest);
 extern void * GobiNetThread(void *pData);
-extern void udhcpc_start(const char *ifname, int IPType, int rawIP);
-extern void udhcpc_stop(const char *ifname);
+extern void udhcpc_start(PROFILE_T *profile);
+extern void udhcpc_stop(PROFILE_T *profile);
 extern void dump_qmi(void *dataBuffer, int dataLen);
 extern void qmidevice_send_event_to_main(int triger_event);
 extern int requestSetEthMode(PROFILE_T *profile);
@@ -103,18 +147,17 @@ extern int requestDeactivateDefaultPDP(void);
 extern int requestSetProfile(PROFILE_T *profile);
 extern int requestGetProfile(PROFILE_T *profile);
 extern int requestBaseBandVersion(const char **pp_reversion);
-extern int requestGetIPAddress(IPV4_T *pIpv4);
+extern int requestGetIPAddress(PROFILE_T *profile);
 
 extern FILE *logfilefp;
 extern int debug_qmi;
 extern char * qmichannel;
 extern int qmidevice_control_fd[2];
-extern int clientWDS;
-extern int clientDMS;
-extern int clientNAS;
-extern int clientWDA;
+extern int qmiclientId[QMUX_TYPE_WDS_ADMIN + 1];
 extern void dbg_time (const char *fmt, ...);
 extern USHORT le16_to_cpu(USHORT v16);
 extern UINT  le32_to_cpu (UINT v32);
+extern UINT  ql_swap32(UINT v32);
 extern USHORT cpu_to_le16(USHORT v16);
 extern UINT cpu_to_le32(UINT v32);
+#endif

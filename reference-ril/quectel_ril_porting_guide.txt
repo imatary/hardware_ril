@@ -6,16 +6,55 @@
           [*] USB Generic Serail Driver
           [*] USB Driver for GSM and CMDA modems
           
-    add UC15/UC20/EC20 's Vendor ID and Product ID in option_ids[] of drivers/usb/serial/option.c
-	static const struct usb_device_id option_ids[] = {
-		{ USB_DEVICE(0x05C6, 0x9090) },  //for UC15
-		{ USB_DEVICE(0x05C6, 0x9003) },  //for UC20
-		{ USB_DEVICE(0x05C6, 0x9215) },  //for EC20
+ 		drivers/usb/serial/option.c
+		#if 1 //Added by Quectel
+			{ USB_DEVICE(0x05C6, 0x9090) }, /* Quectel UC15 */
+			{ USB_DEVICE(0x05C6, 0x9003) }, /* Quectel UC20 */
+			{ USB_DEVICE(0x05C6, 0x9215) }, /* Quectel EC20 */
+			{ USB_DEVICE(0x2C7C, 0x0125) }, /* Quectel EC25 */
+			{ USB_DEVICE(0x2C7C, 0x0121) }, /* Quectel EC21 */
+		#endif
+
+		#if 1 //Added by Quectel
+			//Quectel UC20's interface 4 can be used as USB Network device
+			if (serial->dev->descriptor.idVendor == cpu_to_le16(0x05C6) && serial->dev->descriptor.idProduct == cpu_to_le16(0x9003)
+				&& serial->interface->cur_altsetting->desc.bInterfaceNumber >= 4)
+				return -ENODEV;
+			//Quectel EC20's interface 4 can be used as USB Network device
+			if (serial->dev->descriptor.idVendor == cpu_to_le16(0x05C6) && serial->dev->descriptor.idProduct == cpu_to_le16(0x9215)
+				&& serial->interface->cur_altsetting->desc.bInterfaceNumber >= 4)
+				return -ENODEV;
+			//Quectel EC25&EC21 's interface 4 can be used as USB Network device
+			if (serial->dev->descriptor.idVendor == cpu_to_le16(0x2C7C)
+				&& serial->interface->cur_altsetting->desc.bInterfaceNumber >= 4)
+				return -ENODEV;
+		#endif
+		
+		drivers/usb/serial/usb_wwan.c
+		#if 1 //Added by Quectel for Zero Packet
+			if (dir == USB_DIR_OUT) {
+				struct usb_device_descriptor *desc = &serial->dev->descriptor;
+				if (desc->idVendor == cpu_to_le16(0x05C6) && desc->idProduct == cpu_to_le16(0x9090))
+					urb->transfer_flags |= URB_ZERO_PACKET;
+				if (desc->idVendor == cpu_to_le16(0x05C6) && desc->idProduct == cpu_to_le16(0x9003))
+					urb->transfer_flags |= URB_ZERO_PACKET;
+				if (desc->idVendor == cpu_to_le16(0x05C6) && desc->idProduct == cpu_to_le16(0x9215))
+					urb->transfer_flags |= URB_ZERO_PACKET;
+				if (desc->idVendor == cpu_to_le16(0x2C7C))
+					urb->transfer_flags |= URB_ZERO_PACKET;
+			}
+		#endif
 		
   1.2 USB Driver Configure for UG95/UG96
     Device Drivers  --->
       [*] USB support  --->
         <*> USB Modem (CDC ACM) support
+  
+	  drivers/usb/class/cdc-acm.c
+	  #if 1 //add by Quectel
+			if (usb_dev->descriptor.idVendor == 0x1519 && usb_dev->descriptor.idProduct == 0x0020)
+				snd->urb->transfer_flags |= URB_ZERO_PACKET;
+		#endif
   
   1.3 PPP Configure
     Device Drivers  --->
@@ -58,5 +97,4 @@
 		system/bin/chat <-> hardware/ril/reference-ril/
 		system/lib/libreference-ril.so <-> hardware/ril/reference-ril/
 		system/etc/ppp/ip-down <-> hardware/ril/reference-ril/
-		system/etc/ppp/ip-up <-> hardware/ril/reference-ril/
-
+		system/etc/ppp/ip-up <-> hardware/ril/reference-ril/	

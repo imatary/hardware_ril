@@ -37,6 +37,7 @@
 #include <net/if.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/statfs.h>
 #include "../include/telephony/ril.h"
 
 #define LOG_NDEBUG 0
@@ -48,14 +49,19 @@
 #if 1 //quectel
 /* pathname returned from RIL_REQUEST_SETUP_DATA_CALL / RIL_REQUEST_SETUP_DEFAULT_PDP */
 //#define PPP_TTY_PATH "ppp0"
-#define CONFIG_DEFAULT_PDP 5
+//一些专网卡不能注上公网，且只有设置了APN/USER/PASSWD的情况才能注上专网
+//模块内部默认使用第一路来注网。
+//如果我们使用第一路以外的pdp来拨号，那么就会导致第一路和其他路同时注专网。
+//但专网是不能同时激活多路pdp激活的。
+#define CONFIG_DEFAULT_PDP 1 // 5
 static const char *PPP_TTY_PATH = "ppp0";
 static int s_default_pdp = 1;
 #define CUSD_USE_UCS2_MODE
 //#define USB_HOST_USE_RESET_RESUME //like s5pv210 donnot support usb suspend and wakeup
-#define REFERENCE_RIL_VERSION    "Quectel_Android_RIL_SR01A40V13"
+#define REFERENCE_RIL_VERSION    "Quectel_Android_RIL_SR01A40V17"
 static  char ql_ttyAT[20];
 extern char * ql_get_ttyAT(char *out_ttyname);
+void ql_set_autosuspend(int enable);
 #ifdef USE_NDIS
 extern int ql_pppd_start(const char *modemport, const char *user, const char *password, const char *auth_type, const char *ppp_number);
 extern int ql_pppd_stop(int signo);
@@ -71,6 +77,7 @@ static const char *ql_product_version = NULL;
 #define ql_is_XX(__ql_module_name) (!strncmp(ql_product_version, __ql_module_name, strlen(__ql_module_name)))
 static int ql_is_UC20 = 0;
 static int ql_is_EC20 = 0;
+static int ql_is_EC21 = 0;
 static int ql_is_UG95 = 0;
 static int ql_is_GSM = 0;
 #define NETWORK_DEBOUNCE_TIMEOUT 20
@@ -85,17 +92,30 @@ static int nSetupDataCallFailTimes = 0;
 extern void ql_gps_init(void);
 extern void ql_fwdsvc_init(void);
 
-//#define QUECTEL_DEBUG
-#if 1//def QUECTEL_DEBUG //quectel //for debug-purpose, record logcat msg to file
-//you can fetch logfiles to host-pc by adb tools using command "adb pull /data/ql_log/"
+#if 1 //quectel //for debug-purpose, record logcat msg to file
+//how to use:
+//create dir /data/quectel_debug_log/ on your board, then reboot your board.
+//quectel ril will auto catch android/radio log when your board boot up, and save to dir /data/quectel_debug_log/
+//then you can fetch logfiles to host-pc by adb tools using command "adb pull /data/quectel_debug_log/"
+//remember to delete this dir /data/quectel_debug_log/ when you donot need this function.
+#define QL_DEBUG_LOG_PATH "/data/quectel_debug_log"
+static int ql_debug_space_available(void) {
+        struct statfs stat;
+        if (!statfs(QL_DEBUG_LOG_PATH, &stat)) {
+            int free_space = (((stat.f_bfree*100)/stat.f_blocks));
+            LOGD("%s %d%%", __func__, free_space);
+            return (free_space > 20);
+    }
+        return 0;
+}
 static void log_dmesg(const char *tag) {
 #if 1 // may take long time
-    if (access("/data/ql_log", W_OK))
+    if (access(QL_DEBUG_LOG_PATH, W_OK) || !ql_debug_space_available())
         return;
 
     if (fork() == 0)
     {
-        char logcat_cmd[100];
+        char logcat_cmd[256];
         void *pbuf;;
         size_t len;
         time_t rawtime;
@@ -103,7 +123,7 @@ static void log_dmesg(const char *tag) {
         FILE *dmesgfp, *logfilefp;
         time(&rawtime);
         timeinfo=localtime(&rawtime );
-        sprintf(logcat_cmd, "/data/ql_log/%02d%02d_%02d%02d%02d_dmesg_%s.txt",
+        sprintf(logcat_cmd, QL_DEBUG_LOG_PATH"/%02d%02d_%02d%02d%02d_dmesg_%s.txt",
     		timeinfo->tm_mon+1, timeinfo->tm_mday, timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec, tag);
         logfilefp = NULL; //fopen(logcat_cmd, "wb");
         dmesgfp = popen("dmesg -c", "r");
@@ -631,7 +651,7 @@ static void requestRadioPower(void *data, size_t datalen, RIL_Token t)
     if (onOff == 0 && sState != RADIO_STATE_OFF) {
         const char SHUTDOWN_ACTION_PROPERTY[PROPERTY_VALUE_MAX] = "sys.shutdown.requested";
         char shutdownAction[PROPERTY_VALUE_MAX];
-        if ((ql_is_UC20 || ql_is_EC20) && (property_get(SHUTDOWN_ACTION_PROPERTY, shutdownAction, NULL) > 0)) {
+        if (!ql_mux_enabled && (property_get(SHUTDOWN_ACTION_PROPERTY, shutdownAction, NULL) > 0)) {
             int timeout = 0;
             LOGD("%s shutdownAction is %s", __func__, shutdownAction);
 #if 0 //quectel, i guess nobody like this, because it take long time waiting for moderm shutdown
@@ -699,16 +719,20 @@ static void requestDataCallList(void *data, size_t datalen, RIL_Token t)
 }
 
 static void onDataCallExit(void *param) {
-    if (bSetupDataCallCompelete == 0 && ql_is_EC20) {
+    if (bSetupDataCallCompelete == 0/* && ql_is_EC20*/) {
         int cgreg_response[4];
         quectel_at_cgreg(cgreg_response);
         if (cgreg_response[0] != 1 && cgreg_response[0] != 5) {
             int cops_response[4];
             quectel_at_cops(cops_response);
             if (cops_response[3] == 7) { //lte moe
+#if 0
+//有些专网卡注不上公网，且只有在设置了专网APN的情况下，才能注上公网，
+//所以这里不能清楚掉妆网的APN信息
                 at_send_command("AT+CGDCONT=1,\"IPV4V6\",\"\"",  NULL);
                 at_send_command("AT+CGATT=0",  NULL);
                 at_send_command("AT+CGATT=1",  NULL);
+#endif
            }
         }
     }
@@ -761,7 +785,7 @@ static void requestOrSendDataCallList(RIL_Token *t)
 
     err = at_send_command_multiline ("AT+CGACT?", "+CGACT:", &p_response);
     if (err != 0 || p_response == NULL || p_response->success == 0) {
-        if (ql_is_EC20) { //cdma donot support this at
+        if (ql_is_EC20 || ql_is_EC21) { //cdma donot support this at
              responses[0].cid = s_default_pdp;
              responses[0].active = 0;
              get_local_ip(propValue);
@@ -800,7 +824,7 @@ static void requestOrSendDataCallList(RIL_Token *t)
             goto error;
 
 #if 1 //EC20 bug, if use same profile settings for pdp 1 & 5 and active pdp 5, but AT+CGACT? show pdp 5 is de-active
-        if ((ql_is_EC20 || ql_is_XX("EC25") || ql_is_XX("EC21"))&& responses[0].active == 0) {
+        if ((ql_is_EC20 || ql_is_EC21) && responses[0].active == 0) {
              get_local_ip(propValue);
              if (strcmp(propValue, "0.0.0.0")) {
                 responses[0].active = 1;
@@ -1894,7 +1918,7 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
     at_send_command("AT&D2", NULL);
 #endif
 #ifdef USB_HOST_USE_RESET_RESUME
-    if (ql_is_UC20 || ql_is_EC20)
+    if (!ql_mux_enabled)
         at_send_command("AT&D0", NULL);
 #endif
 
@@ -1917,13 +1941,20 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
     if (cgreg_response[0] != 1 && cgreg_response[0] != 5) {
         if (ql_is_EC20) {
             if (cops_response[3] == 7) { //lte moe
+#if 0
+//有些专网卡注不上公网，且只有在设置了专网APN的情况下，才能注上公网，
+//所以这里不能清楚掉妆网的APN信息
                 at_send_command("AT+CGDCONT=1,\"IPV4V6\",\"\"",  NULL);
                 at_send_command("AT+CGATT=0",  NULL);
                 at_send_command("AT+CGATT=1",  NULL);
+#endif
            }
         }
-        if (ql_is_UC20) {
-            if (cops_response[3] == 6) {
+//如果CGREG显示掉网，但是COPS显示注网、那可能是模块出bug了，UC15/UC20/EC20均遇到过这种情况
+//所以这里开关下飞行模式、希望模块能够恢复正常
+        //if (ql_is_UC20)
+        {
+            if (cops_response[3]/* == 6*/) {
                 at_send_command("AT+CFUN=4",  NULL);
                 sleep(3);
                 at_send_command("AT+CFUN=1",  NULL);
@@ -1971,7 +2002,7 @@ static void requestSetupDataCall(void *data, size_t datalen, RIL_Token t)
         ql_pppd_pid = ql_pppd_start(CMUX_PPP_PORT, user, pass, auth_type, ppp_number);
     else {
         char *usbnet_adapeter = NULL;
-        if ((ql_is_UC20 || ql_is_EC20 || ql_is_XX("EC25") || ql_is_XX("EC21")) && !ql_get_ndisname(&usbnet_adapeter) && usbnet_adapeter) {
+        if ((ql_is_UC20 || ql_is_EC20 || ql_is_EC21) && !ql_get_ndisname(&usbnet_adapeter) && usbnet_adapeter) {
             PPP_TTY_PATH = usbnet_adapeter;
             ql_pppd_pid = ql_ndis_start(apn, user, pass, auth_type, s_default_pdp);
         } else {
@@ -2684,29 +2715,6 @@ error:
  *  Add new function to handle more requests.
  *  Must response to RIL.JAVA.
  */
-static int Ec20CanSleep(void)
-{
-	int err;
-	int n = 0;
-#if 0
-	char *line = NULL;
-	ATResponse *atResponse = NULL;
-
-	err = at_send_command_singleline("AT+QSCLK?","+QSCLK:",&atResponse);
-	if (err != 0) return 0;
-
-	line = atResponse->p_intermediates->line;
-	err = at_tok_start(&line);
-	if (err < 0) return 0;
-
-	err = at_tok_nextint(&line,&n);
-	if (err < 0) return 0;
-	LOGE("queryQSCLK=%d\n", n);
-#endif
-	if (!n)
-		at_send_command("AT+QSCLK=1", NULL);
-	return n;
-}
 
 /*
 * Function: requestScreenState
@@ -2726,20 +2734,56 @@ static void requestScreenState(void *data, size_t datalen, RIL_Token t)
         }
     }
 #endif
-    if (ql_is_EC20) {
-        if (!(((int *)data)[0])) {
-            Ec20CanSleep();
-            at_send_command("AT+CREG=0", NULL);
-            at_send_command("AT+CGREG=0", NULL);
-        }else{
-            at_send_command("AT+CREG=2", NULL);
-            at_send_command("AT+CGREG=2", NULL);
+
+#if 0 //use "AT+CGPADDR=1" to check if ip change on module side.
+    if (((int *)data)[0] && bSetupDataCallCompelete && (ql_is_EC20 || ql_is_EC21)) {
+        char ppp_local_ip[64];
+        get_local_ip(ppp_local_ip);
+        if (strcmp(ppp_local_ip, "0.0.0.0")) {
+            char *cmd;
+            ATResponse *p_response = NULL;
+            int err;
+            int ip_change = 0;
+            asprintf(&cmd, "AT+CGPADDR=%d", s_default_pdp);
+            err = at_send_command_singleline(cmd, "+CGPADDR: ", &p_response);
+            free(cmd);
+            if (err < 0 || p_response == NULL || p_response->success == 0) {
+                //ip_change = 1; 
+            } else {
+                int pdp;
+                char *ppp_remote_ip = "127.0.0.1";
+                char *line = p_response->p_intermediates->line;
+                err = at_tok_start(&line);
+                if (err < 0) goto error;
+                err = at_tok_nextint(&line,&pdp);
+                if (err < 0) goto error;
+                err = at_tok_nextstr(&line,&ppp_remote_ip);
+                if (ppp_remote_ip == NULL)
+                    ppp_remote_ip = "127.0.0.1";
+            error:
+                ip_change = strcmp(ppp_local_ip, ppp_remote_ip);
+                if (ip_change) {
+                    LOGD("localIP: %s VS remoteIP: %s", ppp_local_ip, ppp_remote_ip);
+                }
+            }
+            if (ip_change) {
+                if (!strncmp(PPP_TTY_PATH, "ppp", 3))
+                    ql_pppd_stop(SIGTERM);
+                else
+                    ql_ndis_stop(SIGTERM);
+            }
+            at_response_free(p_response);
         }
     }
+#endif
+
     //Add by Wythe.WANG for XingWang test 2016/1/20
     //Use AT^DATAMODE here to check whether the ppp linker is still alive on modem side
     if(ql_is_EC20 && (((int *)data)[0]) && !strcmp(PPP_TTY_PATH, "ppp0") && !access("/sys/class/net/ppp0", R_OK))
         quectel_at_datamode();
+
+    if ((ql_is_EC20 || ql_is_EC21) && (((int *)data)[0]) && strcmp(PPP_TTY_PATH, "ppp0"))
+        ql_ndis_stop(SIGUSR2);
 
     RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
 }
@@ -2845,7 +2889,7 @@ static void requestSetPreferredNetworkType(void *data, size_t datalen, RIL_Token
         break;
     }
 
-    if (ql_is_EC20) { //4G modules
+    if (ql_is_EC20 || ql_is_EC21) { //4G modules
 //RILConstants.java (frameworks\base\telephony\java\com\android\internal\telephony)
 //int PREFERRED_NETWORK_MODE      = NETWORK_MODE_WCDMA_PREF;
 //must change to NETWORK_MODE_LTE_CMDA_EVDO_GSM_WCDMA in order to use 4G
@@ -2907,7 +2951,7 @@ static void requestSetPreferredNetworkType(void *data, size_t datalen, RIL_Token
 #define EC20_NWSCANSEQ "0405030201"
         if (ql_is_UC20) {
             default_scanseq = UC20_NWSCANSEQ;
-        } else if (ql_is_EC20) {
+        } else if (ql_is_EC20 || ql_is_EC21) {
             default_scanseq = EC20_NWSCANSEQ;
         }
         scanseq_set = (strlen(default_scanseq) != strlen(cur_scanseq)) || strncmp(cur_scanseq, default_scanseq, strlen(default_scanseq));
@@ -3051,7 +3095,7 @@ static void requestQueryCallForwardStatus(void *data, size_t datalen, RIL_Token 
     ATResponse *atResponse;
     int i = 0;
 
-    if (ql_is_EC20) { //will make modules register 2G/3G from 4G
+    if (ql_is_EC20 || ql_is_EC21) { //will make modules register 2G/3G from 4G
         i = 0;
         r_callForwardInfo[i] = (RIL_CallForwardInfo *)alloca(sizeof(RIL_CallForwardInfo));
         bzero(r_callForwardInfo[i],sizeof(RIL_CallForwardInfo));
@@ -3105,7 +3149,7 @@ static void requestSetCallForward(void *data, size_t datalen, RIL_Token t)
     int err;
     RIL_CallForwardInfo *callForwardInfo = (RIL_CallForwardInfo *)data;
 
-    if (ql_is_EC20) { //will make modules register 2G/3G from 4G
+    if (ql_is_EC20 || ql_is_EC21) { //will make modules register 2G/3G from 4G
         RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
         return;
     }
@@ -3393,7 +3437,7 @@ static void requestGetPreferredNetworkType(RIL_Token t)
     	nwscanmode = PREF_NET_TYPE_GSM_WCDMA; /* for 3G Preferred */
     }
 
-    if (ql_is_EC20) { //4G modules
+    if (ql_is_EC20 || ql_is_EC21) { //4G modules
 //RILConstants.java (frameworks\base\telephony\java\com\android\internal\telephony)
 //int PREFERRED_NETWORK_MODE      = NETWORK_MODE_WCDMA_PREF;
 //must change to NETWORK_MODE_LTE_CMDA_EVDO_GSM_WCDMA in order to use 4G
@@ -4376,7 +4420,7 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
                 RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
                 break;
             }
-            if (ql_is_UC20 || ql_is_GSM || ql_is_EC20)
+            if (ql_is_UC20 || ql_is_GSM || ql_is_EC20 || ql_is_EC21)
                 requestSetPreferredNetworkType(data,datalen,t);
             else
                 RIL_onRequestComplete(t, RIL_E_REQUEST_NOT_SUPPORTED, NULL, 0);
@@ -4429,7 +4473,7 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
          *  Wythe 2013-9-27
          */
         case RIL_REQUEST_GET_PREFERRED_NETWORK_TYPE:
-        if (ql_is_UC20 || ql_is_GSM || ql_is_EC20)
+        if (ql_is_UC20 || ql_is_GSM || ql_is_EC20 || ql_is_EC21)
             requestGetPreferredNetworkType(t);
         else
             	RIL_onRequestComplete(t, RIL_E_REQUEST_NOT_SUPPORTED, NULL, 0);
@@ -4490,6 +4534,10 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
                 rild_restart = 0;
                 LOGD("gsm.sim.state = %s", prop_value);
             }
+#endif
+#if 1
+        if (!ql_mux_enabled)  //if has sim card, it is better to disable auto-suspend function, because it may cause usb disconnect
+            ql_set_autosuspend(p_card_status->card_state != RIL_CARDSTATE_PRESENT);
 #endif
             freeCardStatus(p_card_status);
             break;
@@ -5362,6 +5410,24 @@ error:
     return -1;
 }
 
+static void initializeLaterCallback(void *param)
+{
+    ATResponse *p_response = NULL;
+    int err = 0;
+    int need_init_again = 0;
+    static int max_init_times = 30;
+
+    err = at_send_command("AT+QSCLK=1", &p_response); //Configure Whether or not to Enter into Sleep Mode
+    if (err < 0 || p_response == NULL || p_response->success == 0)
+        need_init_again++;
+    at_response_free(p_response);
+
+    if (need_init_again && max_init_times--)
+        RIL_requestTimedCallback(initializeLaterCallback, NULL, &TIMEVAL_1);
+    else
+        max_init_times = 30;
+}
+
 static void initializeCustomerCallback(void *param)
 {
 #if 0
@@ -5396,7 +5462,7 @@ static void initializeCallback(void *param)
 
 #if 1 //quectel display module software version
 __get_ql_product:
-    ql_is_UC20 = ql_is_EC20 = ql_is_UG95 = ql_is_GSM = 0;
+    ql_is_UC20 = ql_is_EC20 = ql_is_EC21 = ql_is_UG95 = ql_is_GSM = 0;
     ql_product_version = NULL; //"GSMXX"	
     err = at_send_command_multiline("ATI", "\0", &p_response);
     if (!err && p_response && p_response->success) {
@@ -5416,11 +5482,17 @@ __get_ql_product:
         goto __get_ql_product;
     }
     LOGD("Quectel Product Revision: %s", ql_product_version);
+    if (ql_is_XX("EC20CEF")) {
+        ((char *)ql_product_version)[3] = '1';
+    }    
     if (ql_is_XX("UC15") || ql_is_XX("UC20")) {
         ql_is_UC20 = 1;
         LOGD("UCXX");
     } else if (ql_is_XX("EC20")) {
         ql_is_EC20 = 1;
+        LOGD("ECXX");
+    } else if (ql_is_XX("EC21") || ql_is_XX("EC25")) {
+        ql_is_EC21 = 1;
         LOGD("ECXX");
     } else if (ql_is_XX("UG95") || ql_is_XX("UG96")) {
         ql_is_UG95 = 1;
@@ -5430,13 +5502,13 @@ __get_ql_product:
         LOGD("GSMXX");
     }
 
-    if (ql_is_XX("UC20") || ql_is_XX("EC20") || ql_is_XX("EC21") || ql_is_XX("EC25"))
+    if (ql_is_UC20 || ql_is_EC20 || ql_is_EC21)
         ql_gps_init();
     
-    if (ql_is_XX("EC20") || ql_is_XX("EC21") || ql_is_XX("EC25"))
+    if (ql_is_EC20)
         ql_fwdsvc_init();
     
-    at_send_command_multiline("AT+CSUB", "\0", &p_response);
+    at_send_command_multiline("AT+CSUB;+CVERSION", "\0", NULL);
 #endif
 
     /* note: we don't check errors here. Everything important will
@@ -5484,7 +5556,6 @@ __get_ql_product:
 
     if (ql_is_UC20 || ql_is_EC20)
         at_send_command("AT+QCFG=\"QMISYNC\",0", NULL);
-    at_send_command("AT+QSCLK=1", NULL); //Configure Whether or not to Enter into Sleep Mode
 
     if (ql_is_UC20 || ql_is_EC20) {
         //at_send_command("AT+QCFG=\"pwrsavedtr\",0", NULL); //Enable/Disable DTR to Control Power Save State
@@ -5497,6 +5568,13 @@ __get_ql_product:
         //at_send_command("AT+CGDCONT=1,\"IPV4V6\",\"\"",  NULL);
         at_send_command("at+qcfg=\"pdp/duplicatechk\",1", NULL); //carl allow different pdp use same APN, only for EC20?
     }
+
+#if 0
+//设置你的专网卡的APN信息。一些专网卡不能注上公网。
+//且只有设置了专网APN的情况下，才能注上专网.
+//如果是第一次设置，可能还需要先发送AT+CFUN=4, 然后AT+CFUN=1
+    at_send_command("AT+QICSGP=1,1,\"your_apn\", \"your_username\",\"your_password\",1", NULL);
+#endif
 
 #if 0
     at_send_command("AT+QCFG=\"usb/fullspeed\",1", NULL);
@@ -5534,6 +5612,7 @@ __get_ql_product:
     s_recovery_mode = 0;
 
     RIL_requestTimedCallback(initializeCustomerCallback, NULL, &TIMEVAL_0);
+    RIL_requestTimedCallback(initializeLaterCallback, NULL, &TIMEVAL_1);
 }
 
 static void waitForClose()
@@ -5875,24 +5954,28 @@ mainLoop(void *param)
     int fd;
     int ret;
 
-#ifdef QUECTEL_DEBUG
-    if (access("/data/ql_log", W_OK) && errno == ENOENT) {
-        system("/system/bin/mkdir /data/ql_log");
+#if 0
+    //pay attention: 
+    //these codes means will result catch log every time your device boot up.
+    //so make sure these codes are commented in your release software
+    if (access(QL_DEBUG_LOG_PATH, W_OK) && errno == ENOENT) {
+        system("/system/bin/mkdir "QL_DEBUG_LOG_PATH);
     }
 #endif
 
 #if 1 //def QUECTEL_DEBUG //quectel //for debug-purpose, record logcat msg to file
-//you can fetch logfiles to host-pc by adb tools using command "adb pull /data/ql_log/"
-    if (access("/data/ql_log", W_OK) == 0) {
-        char logcat_cmd[100];
+//you can fetch logfiles to host-pc by adb tools using command "adb pull /data/quectel_debug_log/"
+    if (access(QL_DEBUG_LOG_PATH, W_OK) == 0 && ql_debug_space_available()) {
+        char logcat_cmd[256];
         time_t rawtime;
         struct tm *timeinfo;	
+
         time(&rawtime);
         timeinfo=localtime(&rawtime );
-        sprintf(logcat_cmd, "/system/bin/logcat -v time -f /data/ql_log/%02d%02d_%02d%02d%02d_logcat.txt &",
+        sprintf(logcat_cmd, "/system/bin/logcat -v time -f " QL_DEBUG_LOG_PATH "/%02d%02d_%02d%02d%02d_logcat.txt &",
     		timeinfo->tm_mon+1, timeinfo->tm_mday, timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
         system(logcat_cmd);
-        sprintf(logcat_cmd, "/system/bin/logcat -b radio -v time -f /data/ql_log/%02d%02d_%02d%02d%02d_radio.txt &",
+        sprintf(logcat_cmd, "/system/bin/logcat -b radio -v time -f " QL_DEBUG_LOG_PATH "/%02d%02d_%02d%02d%02d_radio.txt &",
     		timeinfo->tm_mon+1, timeinfo->tm_mday, timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec);
         system(logcat_cmd);
     }
@@ -6023,13 +6106,17 @@ const RIL_RadioFunctions *RIL_Init(const struct RIL_Env *env, int argc, char **a
     if (anroid_version <= 40) QL_RIL_VERSION = 6;
     else if (anroid_version == 41) QL_RIL_VERSION = 6;
     else if (anroid_version == 42) QL_RIL_VERSION = 7;
-    else if (anroid_version == 43) QL_RIL_VERSION = 8;
+    else if (anroid_version == 43) QL_RIL_VERSION = 8; //maybe should be 7
     else if (anroid_version == 44) QL_RIL_VERSION = 9;
     else if (anroid_version == 50) QL_RIL_VERSION = 10;
     else if (anroid_version == 51) QL_RIL_VERSION = 11;
     else if (anroid_version == 60) QL_RIL_VERSION = 11;
     else LOGE("Unsupport Android Version %d by Quectel Now!!!!", anroid_version);
     LOGD("Android Version: %d, RIL_VERSION: %d / %d", anroid_version, QL_RIL_VERSION, RIL_VERSION);
+#ifndef USE_NDK
+    if (QL_RIL_VERSION != RIL_VERSION) //maybe get error when dynamic detect ril version
+        QL_RIL_VERSION = RIL_VERSION;
+#endif
     s_callbacks.version = QL_RIL_VERSION;
     if (property_get("ro.build.description", prop_value, NULL) > 0) {
         LOGD("[ro.build.description]: [%s]", prop_value);
@@ -6110,6 +6197,10 @@ const RIL_RadioFunctions *RIL_Init(const struct RIL_Env *env, int argc, char **a
 
             default:
                 usage(argv[0]);
+                #if 1 //Quectel
+                LOGI("unkonw opt = %c\n", opt);
+                break;
+                #endif
                 return NULL;
         }
     }

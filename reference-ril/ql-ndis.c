@@ -346,6 +346,14 @@ int ql_ndis_start(const char *apn, const char *user, const char *password, const
 
 int ql_ndis_stop(int signo) {
     unsigned int kill_time = 15000;
+
+    if (signo == SIGUSR2) {
+        //used to check data call state
+        if (ql_ndis_pid != 0)
+            kill(ql_ndis_pid, signo);
+        return 0;
+    }
+
     ql_ndis_quit = 1;
 
     if (ql_ndis_pid == 0 && ql_ndis_thread == 0)

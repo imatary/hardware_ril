@@ -49,15 +49,29 @@ static const char *ipaddr_to_string(in_addr_t addr)
     return inet_ntoa(in_addr);
 }
 
-void do_dhcp_request(const char *ifname) {
+void do_dhcp_request(PROFILE_T *profile) {
 #ifdef USE_NDK
     if (!ifc_init ||!ifc_close ||!do_dhcp || !get_dhcp_info || !property_set) {
         return;
     }    
 #endif
-    
+
+    char *ifname = profile->usbnet_adapter;
     uint32_t ipaddr, gateway, prefixLength, dns1, dns2, server, lease;
     char propKey[128];
+
+#if 0
+    if (profile->rawIP && ((profile->IPType==0x04 && profile->ipv4.Address)))
+    {
+        snprintf(propKey, sizeof(propKey), "net.%s.dns1", ifname);
+        property_set(propKey, profile->ipv4.DnsPrimary ? ipaddr_to_string(ql_swap32(profile->ipv4.DnsPrimary)) : "8.8.8.8");
+        snprintf(propKey, sizeof(propKey), "net.%s.dns2", ifname);
+        property_set(propKey, profile->ipv4.DnsSecondary ? ipaddr_to_string(ql_swap32(profile->ipv4.DnsSecondary)) : "8.8.8.8");
+        snprintf(propKey, sizeof(propKey), "net.%s.gw", ifname);
+        property_set(propKey, profile->ipv4.Gateway ? ipaddr_to_string(ql_swap32(profile->ipv4.Gateway)) : "0.0.0.0");
+        return;
+    }
+#endif
 
     if(ifc_init()) {
         dbg_time("failed to ifc_init(%s): %s\n", ifname, strerror(errno));

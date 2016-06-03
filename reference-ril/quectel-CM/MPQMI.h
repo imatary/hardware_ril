@@ -27,6 +27,7 @@ typedef unsigned char   UCHAR;
 typedef unsigned short   USHORT;
 typedef int   INT;
 typedef unsigned int   UINT;
+typedef long    LONG;
 typedef unsigned int   ULONG;
 typedef unsigned long long   ULONG64;
 typedef char   *PCHAR;
@@ -75,6 +76,7 @@ typedef enum _QMI_SERVICE_TYPE
    QMUX_TYPE_QOS  = 0x04,
    QMUX_TYPE_WMS  = 0x05,
    QMUX_TYPE_PDS  = 0x06,
+   QMUX_TYPE_UIM  = 0x0B,
    QMUX_TYPE_WDS_ADMIN  = 0x1A,
    QMUX_TYPE_MAX  = 0xFF,
    QMUX_TYPE_ALL  = 0xFF

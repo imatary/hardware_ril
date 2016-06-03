@@ -116,6 +116,19 @@ UINT  le32_to_cpu (UINT v32) {
     return tmp;
 }
 
+UINT ql_swap32(UINT v32) {
+    UINT tmp = v32;
+    {
+        unsigned char *s = (unsigned char *)(&v32);
+        unsigned char *d = (unsigned char *)(&tmp);
+        d[0] = s[3];
+        d[1] = s[2];
+        d[2] = s[1];
+        d[3] = s[0];
+    }
+    return tmp;
+}
+
 USHORT cpu_to_le16(USHORT v16) {
     USHORT tmp = v16;
     if (is_bigendian()) {

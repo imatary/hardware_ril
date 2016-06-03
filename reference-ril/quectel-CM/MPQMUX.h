@@ -2223,6 +2223,9 @@ typedef struct _QMIWMS_EVENT_REPORT_IND_MSG
 #define QMINAS_GET_PLMN_NAME_RESP               0x0044
 #define QUECTEL_PACKET_TRANSFER_START_IND 0X100
 #define QUECTEL_PACKET_TRANSFER_END_IND 0X101
+#define QMINAS_GET_SYS_INFO_REQ                 0x004D
+#define QMINAS_GET_SYS_INFO_RESP                0x004D
+#define QMINAS_SYS_INFO_IND                     0x004D
 
 typedef struct _QMINAS_GET_HOME_NETWORK_REQ_MSG
 {
@@ -2384,6 +2387,208 @@ typedef struct _SERVING_SYSTEM
    UCHAR  InUseRadioIF;
    UCHAR  RadioIF;
 } __attribute__ ((packed)) SERVING_SYSTEM, *PSERVING_SYSTEM;
+
+typedef struct _QMINAS_GET_SYS_INFO_RESP_MSG
+{
+   USHORT Type;
+   USHORT Length;
+   UCHAR  TLVType;
+   USHORT TLVLength;
+   USHORT QMUXResult;
+   USHORT QMUXError;
+} __attribute__ ((packed)) QMINAS_GET_SYS_INFO_RESP_MSG, *PQMINAS_GET_SYS_INFO_RESP_MSG;
+
+typedef struct _QMINAS_SYS_INFO_IND_MSG
+{
+   USHORT Type;
+   USHORT Length;
+} __attribute__ ((packed)) QMINAS_SYS_INFO_IND_MSG, *PQMINAS_SYS_INFO_IND_MSG;
+
+typedef struct _SERVICE_STATUS_INFO
+{  
+   UCHAR  TLVType;
+   USHORT TLVLength;
+   UCHAR  SrvStatus;
+   UCHAR  IsPrefDataPath;
+} __attribute__ ((packed)) SERVICE_STATUS_INFO, *PSERVICE_STATUS_INFO;
+
+typedef struct _CDMA_SYSTEM_INFO
+{
+   UCHAR  TLVType;
+   USHORT TLVLength;
+   UCHAR  SrvDomainValid;
+   UCHAR  SrvDomain;
+   UCHAR  SrvCapabilityValid;
+   UCHAR  SrvCapability;
+   UCHAR  RoamStatusValid;
+   UCHAR  RoamStatus;
+   UCHAR  IsSysForbiddenValid;
+   UCHAR  IsSysForbidden;
+   UCHAR  IsSysPrlMatchValid;
+   UCHAR  IsSysPrlMatch;
+   UCHAR  PRevInUseValid;
+   UCHAR  PRevInUse;
+   UCHAR  BSPRevValid;
+   UCHAR  BSPRev;
+   UCHAR  CCSSupportedValid;
+   UCHAR  CCSSupported;
+   UCHAR  CDMASysIdValid;
+   USHORT SID;
+   USHORT NID;
+   UCHAR  BSInfoValid;
+   USHORT BaseID;
+   ULONG  BaseLAT;
+   ULONG  BaseLONG;
+   UCHAR  PacketZoneValid;
+   USHORT PacketZone;
+   UCHAR  NetworkIdValid;
+   UCHAR  MCC[3];
+   UCHAR  MNC[3];
+} __attribute__ ((packed)) CDMA_SYSTEM_INFO, *PCDMA_SYSTEM_INFO;
+
+typedef struct _HDR_SYSTEM_INFO
+{
+   UCHAR  TLVType;
+   USHORT TLVLength;
+   UCHAR  SrvDomainValid;
+   UCHAR  SrvDomain;
+   UCHAR  SrvCapabilityValid;
+   UCHAR  SrvCapability;
+   UCHAR  RoamStatusValid;
+   UCHAR  RoamStatus;
+   UCHAR  IsSysForbiddenValid;
+   UCHAR  IsSysForbidden;
+   UCHAR  IsSysPrlMatchValid;
+   UCHAR  IsSysPrlMatch;
+   UCHAR  HdrPersonalityValid;
+   UCHAR  HdrPersonality;
+   UCHAR  HdrActiveProtValid;
+   UCHAR  HdrActiveProt;
+   UCHAR  is856SysIdValid;
+   UCHAR  is856SysId[16];
+} __attribute__ ((packed)) HDR_SYSTEM_INFO, *PHDR_SYSTEM_INFO;
+
+typedef struct _GSM_SYSTEM_INFO
+{
+   UCHAR  TLVType;
+   USHORT TLVLength;
+   UCHAR  SrvDomainValid;
+   UCHAR  SrvDomain;
+   UCHAR  SrvCapabilityValid;
+   UCHAR  SrvCapability;
+   UCHAR  RoamStatusValid;
+   UCHAR  RoamStatus;
+   UCHAR  IsSysForbiddenValid;
+   UCHAR  IsSysForbidden;
+   UCHAR  LacValid;
+   USHORT Lac;
+   UCHAR  CellIdValid;
+   ULONG  CellId;
+   UCHAR  RegRejectInfoValid;
+   UCHAR  RejectSrvDomain;
+   UCHAR  RejCause;
+   UCHAR  NetworkIdValid;
+   UCHAR  MCC[3];
+   UCHAR  MNC[3];
+   UCHAR  EgprsSuppValid;
+   UCHAR  EgprsSupp;
+   UCHAR  DtmSuppValid;
+   UCHAR  DtmSupp;
+} __attribute__ ((packed)) GSM_SYSTEM_INFO, *PGSM_SYSTEM_INFO;
+
+typedef struct _WCDMA_SYSTEM_INFO
+{
+   UCHAR  TLVType;
+   USHORT TLVLength;
+   UCHAR  SrvDomainValid;
+   UCHAR  SrvDomain;
+   UCHAR  SrvCapabilityValid;
+   UCHAR  SrvCapability;
+   UCHAR  RoamStatusValid;
+   UCHAR  RoamStatus;
+   UCHAR  IsSysForbiddenValid;
+   UCHAR  IsSysForbidden;
+   UCHAR  LacValid;
+   USHORT Lac;
+   UCHAR  CellIdValid;
+   ULONG  CellId;
+   UCHAR  RegRejectInfoValid;
+   UCHAR  RejectSrvDomain;
+   UCHAR  RejCause;
+   UCHAR  NetworkIdValid;
+   UCHAR  MCC[3];
+   UCHAR  MNC[3];
+   UCHAR  HsCallStatusValid;
+   UCHAR  HsCallStatus;
+   UCHAR  HsIndValid;
+   UCHAR  HsInd;
+   UCHAR  PscValid;
+   UCHAR  Psc;
+} __attribute__ ((packed)) WCDMA_SYSTEM_INFO, *PWCDMA_SYSTEM_INFO;
+
+typedef struct _LTE_SYSTEM_INFO
+{
+   UCHAR  TLVType;
+   USHORT TLVLength;
+   UCHAR  SrvDomainValid;
+   UCHAR  SrvDomain;
+   UCHAR  SrvCapabilityValid;
+   UCHAR  SrvCapability;
+   UCHAR  RoamStatusValid;
+   UCHAR  RoamStatus;
+   UCHAR  IsSysForbiddenValid;
+   UCHAR  IsSysForbidden;
+   UCHAR  LacValid;
+   USHORT Lac;
+   UCHAR  CellIdValid;
+   ULONG  CellId;
+   UCHAR  RegRejectInfoValid;
+   UCHAR  RejectSrvDomain;
+   UCHAR  RejCause;
+   UCHAR  NetworkIdValid;
+   UCHAR  MCC[3];
+   UCHAR  MNC[3];
+   UCHAR  TacValid;
+   USHORT Tac;
+} __attribute__ ((packed)) LTE_SYSTEM_INFO, *PLTE_SYSTEM_INFO;
+
+typedef struct _TDSCDMA_SYSTEM_INFO
+{
+   UCHAR  TLVType;
+   USHORT TLVLength;
+   UCHAR  SrvDomainValid;
+   UCHAR  SrvDomain;
+   UCHAR  SrvCapabilityValid;
+   UCHAR  SrvCapability;
+   UCHAR  RoamStatusValid;
+   UCHAR  RoamStatus;
+   UCHAR  IsSysForbiddenValid;
+   UCHAR  IsSysForbidden;
+   UCHAR  LacValid;
+   USHORT Lac;
+   UCHAR  CellIdValid;
+   ULONG  CellId;
+   UCHAR  RegRejectInfoValid;
+   UCHAR  RejectSrvDomain;
+   UCHAR  RejCause;
+   UCHAR  NetworkIdValid;
+   UCHAR  MCC[3];
+   UCHAR  MNC[3];
+   UCHAR  HsCallStatusValid;
+   UCHAR  HsCallStatus;
+   UCHAR  HsIndValid;
+   UCHAR  HsInd;
+   UCHAR  CellParameterIdValid;
+   USHORT CellParameterId;
+   UCHAR  CellBroadcastCapValid;
+   ULONG  CellBroadcastCap;
+   UCHAR  CsBarStatusValid;
+   ULONG  CsBarStatus;
+   UCHAR  PsBarStatusValid;
+   ULONG  PsBarStatus;
+   UCHAR  CipherDomainValid;
+   UCHAR  CipherDomain;
+} __attribute__ ((packed)) TDSCDMA_SYSTEM_INFO, *PTDSCDMA_SYSTEM_INFO;
 
 #if 0
 typedef struct _QMINAS_SERVING_SYSTEM_IND_MSG
@@ -2731,6 +2936,115 @@ typedef struct _QMINAS_INITIATE_ATTACH_RESP_MSG
 #endif
 // ======================= End of NAS ==============================
 
+// ======================= UIM ==============================
+#define QMIUIM_READ_TRANSPARENT_REQ      0x0020
+#define QMIUIM_READ_TRANSPARENT_RESP     0x0020
+#define QMIUIM_READ_TRANSPARENT_IND      0x0020
+#define QMIUIM_READ_RECORD_REQ           0x0021
+#define QMIUIM_READ_RECORD_RESP          0x0021
+#define QMIUIM_READ_RECORD_IND           0x0021
+#define QMIUIM_WRITE_TRANSPARENT_REQ     0x0022
+#define QMIUIM_WRITE_TRANSPARENT_RESP    0x0022
+#define QMIUIM_WRITE_TRANSPARENT_IND     0x0022
+#define QMIUIM_WRITE_RECORD_REQ          0x0023
+#define QMIUIM_WRITE_RECORD_RESP         0x0023
+#define QMIUIM_WRITE_RECORD_IND          0x0023
+#define QMIUIM_SET_PIN_PROTECTION_REQ    0x0025
+#define QMIUIM_SET_PIN_PROTECTION_RESP   0x0025
+#define QMIUIM_SET_PIN_PROTECTION_IND    0x0025
+#define QMIUIM_VERIFY_PIN_REQ            0x0026
+#define QMIUIM_VERIFY_PIN_RESP           0x0026
+#define QMIUIM_VERIFY_PIN_IND            0x0026
+#define QMIUIM_UNBLOCK_PIN_REQ           0x0027
+#define QMIUIM_UNBLOCK_PIN_RESP          0x0027
+#define QMIUIM_UNBLOCK_PIN_IND           0x0027
+#define QMIUIM_CHANGE_PIN_REQ            0x0028
+#define QMIUIM_CHANGE_PIN_RESP           0x0028
+#define QMIUIM_CHANGE_PIN_IND            0x0028
+#define QMIUIM_DEPERSONALIZATION_REQ     0x0029
+#define QMIUIM_DEPERSONALIZATION_RESP    0x0029
+#define QMIUIM_EVENT_REG_REQ             0x002E
+#define QMIUIM_EVENT_REG_RESP            0x002E
+#define QMIUIM_GET_CARD_STATUS_REQ       0x002F
+#define QMIUIM_GET_CARD_STATUS_RESP      0x002F
+#define QMIUIM_STATUS_CHANGE_IND         0x0032
+
+
+typedef struct _QMIUIM_GET_CARD_STATUS_RESP_MSG
+{
+   USHORT Type;             
+   USHORT Length;
+   UCHAR  TLVType;          
+   USHORT TLVLength;        
+   USHORT QMUXResult;       
+   USHORT QMUXError;        
+} __attribute__ ((packed)) QMIUIM_GET_CARD_STATUS_RESP_MSG, *PQMIUIM_GET_CARD_STATUS_RESP_MSG;
+
+typedef struct _QMIUIM_CARD_STATUS
+{
+   UCHAR  TLVType;
+   USHORT TLVLength;
+   USHORT IndexGWPri;
+   USHORT Index1XPri;
+   USHORT IndexGWSec;
+   USHORT Index1XSec;
+   UCHAR  NumSlot;
+   UCHAR  CardState;
+   UCHAR  UPINState;
+   UCHAR  UPINRetries;
+   UCHAR  UPUKRetries;
+   UCHAR  ErrorCode;
+   UCHAR  NumApp;
+   UCHAR  AppType;
+   UCHAR  AppState;
+   UCHAR  PersoState;
+   UCHAR  PersoFeature;
+   UCHAR  PersoRetries;
+   UCHAR  PersoUnblockRetries;
+   UCHAR  AIDLength;
+} __attribute__ ((packed)) QMIUIM_CARD_STATUS, *PQMIUIM_CARD_STATUS;
+
+typedef struct _QMIUIM_PIN_STATE
+{
+   UCHAR  UnivPIN;
+   UCHAR  PIN1State;
+   UCHAR  PIN1Retries;
+   UCHAR  PUK1Retries;
+   UCHAR  PIN2State;
+   UCHAR  PIN2Retries;
+   UCHAR  PUK2Retries;
+} __attribute__ ((packed)) QMIUIM_PIN_STATE, *PQMIUIM_PIN_STATE;
+
+typedef struct _QMIUIM_VERIFY_PIN_REQ_MSG
+{
+   USHORT Type;     
+   USHORT Length;
+   UCHAR  TLVType;  
+   USHORT TLVLength;
+   UCHAR  Session_Type;
+   UCHAR  Aid_Len;
+   UCHAR  TLV2Type;  
+   USHORT TLV2Length;
+   UCHAR  PINID;
+   UCHAR  PINLen;
+   UCHAR  PINValue;
+} __attribute__ ((packed)) QMIUIM_VERIFY_PIN_REQ_MSG, *PQMIUIM_VERIFY_PIN_REQ_MSG;
+
+typedef struct _QMIUIM_VERIFY_PIN_RESP_MSG
+{
+   USHORT Type;     
+   USHORT Length;
+   UCHAR  TLVType;  
+   USHORT TLVLength;
+   USHORT QMUXResult;
+   USHORT QMUXError;
+   UCHAR  TLV2Type; 
+   USHORT TLV2Length; 
+   UCHAR  PINVerifyRetriesLeft;
+   UCHAR  PINUnblockRetriesLeft;
+} __attribute__ ((packed)) QMIUIM_VERIFY_PIN_RESP_MSG, *PQMIUIM_VERIFY_PIN_RESP_MSG;
+
+
 typedef struct _QMUX_MSG
 {
    QCQMUX_HDR QMUXHdr;
@@ -2880,6 +3194,8 @@ typedef struct _QMUX_MSG
       QMINAS_GET_SERVING_SYSTEM_REQ_MSG         GetServingSystemReq;
 #endif
       QMINAS_GET_SERVING_SYSTEM_RESP_MSG        GetServingSystemResp;
+      QMINAS_GET_SYS_INFO_RESP_MSG              GetSysInfoResp;
+      QMINAS_SYS_INFO_IND_MSG                   NasSysInfoInd;
 #if 0
       QMINAS_SERVING_SYSTEM_IND_MSG             NasServingSystemInd;
       QMINAS_SET_PREFERRED_NETWORK_REQ_MSG      SetPreferredNetworkReq;
@@ -2903,6 +3219,21 @@ typedef struct _QMUX_MSG
       QMINAS_INITIATE_ATTACH_RESP_MSG           InitiateAttachResp;
       QMINAS_GET_PLMN_NAME_REQ_MSG              GetPLMNNameReq;
       QMINAS_GET_PLMN_NAME_RESP_MSG             GetPLMNNameResp;
+#endif
+
+      // QMIUIM Messages
+      QMIUIM_GET_CARD_STATUS_RESP_MSG           UIMGetCardStatus;
+      QMIUIM_VERIFY_PIN_REQ_MSG                 UIMUIMVerifyPinReq;
+      QMIUIM_VERIFY_PIN_RESP_MSG                UIMUIMVerifyPinResp;
+#if 0
+      QMIUIM_SET_PIN_PROTECTION_REQ_MSG         UIMUIMSetPinProtectionReq;
+      QMIUIM_SET_PIN_PROTECTION_RESP_MSG        UIMUIMSetPinProtectionResp;
+      QMIUIM_CHANGE_PIN_REQ_MSG                 UIMUIMChangePinReq;
+      QMIUIM_CHANGE_PIN_RESP_MSG                UIMUIMChangePinResp;
+      QMIUIM_UNBLOCK_PIN_REQ_MSG                UIMUIMUnblockPinReq;
+      QMIUIM_UNBLOCK_PIN_RESP_MSG               UIMUIMUnblockPinResp;
+      QMIUIM_READ_TRANSPARENT_REQ_MSG           UIMUIMReadTransparentReq;
+      QMIUIM_READ_TRANSPARENT_RESP_MSG          UIMUIMReadTransparentResp;
 #endif
 
    };

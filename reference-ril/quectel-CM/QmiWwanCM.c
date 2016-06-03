@@ -109,14 +109,16 @@ static int QmiWwanGetClientID(UCHAR QMIType) {
         UCHAR ClientId = pResponse->CTLMsg.GetClientIdRsp.ClientId;
 
         if (!QMUXResult && !QMUXError && (QMIType == pResponse->CTLMsg.GetClientIdRsp.QMIType)) {
+            qmiclientId[QMIType] = ClientId;
             switch (QMIType) {
-                case QMUX_TYPE_WDS: clientWDS = ClientId; dbg_time("Get clientWDS = %d", ClientId); break;
-                case QMUX_TYPE_DMS: clientDMS = ClientId; dbg_time("Get clientDMS = %d", ClientId); break;
-                case QMUX_TYPE_NAS: clientNAS = ClientId; dbg_time("Get clientNAS = %d", ClientId); break;
-                //case QMUX_TYPE_QOS: clientQOS = ClientId; dbg_time("Get clientQOS = %d", ClientId); break;
-                //case QMUX_TYPE_WMS: clientWMS = ClientId; dbg_time("Get clientWMS = %d", ClientId); break;
-                //case QMUX_TYPE_PDS: clientPDS = ClientId; dbg_time("Get clientPDS = %d", ClientId); break;
-                case QMUX_TYPE_WDS_ADMIN: clientWDA = ClientId; dbg_time("Get clientWDA = %d", ClientId);
+                case QMUX_TYPE_WDS: dbg_time("Get clientWDS = %d", ClientId); break;
+                case QMUX_TYPE_DMS: dbg_time("Get clientDMS = %d", ClientId); break;
+                case QMUX_TYPE_NAS: dbg_time("Get clientNAS = %d", ClientId); break;
+                case QMUX_TYPE_QOS: dbg_time("Get clientQOS = %d", ClientId); break;
+                case QMUX_TYPE_WMS: dbg_time("Get clientWMS = %d", ClientId); break;
+                case QMUX_TYPE_PDS: dbg_time("Get clientPDS = %d", ClientId); break;
+                case QMUX_TYPE_UIM: dbg_time("Get clientUIM = %d", ClientId); break;
+                case QMUX_TYPE_WDS_ADMIN: dbg_time("Get clientWDA = %d", ClientId);
                 break;
                 default: break;
             }
@@ -150,22 +152,30 @@ int QmiWwanInit(void) {
     QmiWwanGetClientID(QMUX_TYPE_WDS);
     QmiWwanGetClientID(QMUX_TYPE_DMS);
     QmiWwanGetClientID(QMUX_TYPE_NAS);
+    QmiWwanGetClientID(QMUX_TYPE_UIM);
     QmiWwanGetClientID(QMUX_TYPE_WDS_ADMIN);
     return 0;
 }
 
 int QmiWwanDeInit(void) {
-    if (clientWDS != -1) {QmiWwanReleaseClientID(QMUX_TYPE_WDS, clientWDS);};
-    if (clientDMS != -1) {QmiWwanReleaseClientID(QMUX_TYPE_DMS, clientDMS);};
-    if (clientNAS != -1) {QmiWwanReleaseClientID(QMUX_TYPE_NAS, clientNAS);};
-    if (clientWDA != -1) {QmiWwanReleaseClientID(QMUX_TYPE_WDS_ADMIN, clientWDA);};
+    unsigned int i;
+    for (i = 0; i < sizeof(qmiclientId)/sizeof(qmiclientId[0]); i++)
+    {
+        if (qmiclientId[i] != 0)
+        {
+                QmiWwanReleaseClientID(i, qmiclientId[i]);
+                qmiclientId[i] = 0;
+        }
+    }
+
     return 0;
 }
 
 void * QmiWwanThread(void *pData) {
-    cdc_wdm_fd = open(qmichannel, O_RDWR | O_NONBLOCK | O_NOCTTY);
+    const char *cdc_wdm = (const char *)pData;
+    cdc_wdm_fd = open(cdc_wdm, O_RDWR | O_NONBLOCK | O_NOCTTY);
     if (cdc_wdm_fd == -1) {
-        dbg_time("%s Failed to open %s, errno: %d (%s)", __func__, qmichannel, errno, strerror(errno));
+        dbg_time("%s Failed to open %s, errno: %d (%s)", __func__, cdc_wdm, errno, strerror(errno));
         qmidevice_send_event_to_main(RIL_INDICATE_DEVICE_DISCONNECTED);
         pthread_exit(NULL);
         return NULL;

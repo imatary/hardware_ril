@@ -33,6 +33,7 @@ struct ql_usb_id_struct {
     unsigned short ppp_inf;
     
 };
+static char usbdevice_pah[MAX_PATH];
 static const struct ql_usb_id_struct ql_usb_id_table[] = {
     {0x05c6, 0x9003, 2, 3}, //UC20
     {0x05c6, 0x9090, 2, 3}, //UC15
@@ -117,8 +118,9 @@ static char * ql_get_ttyname(int usb_interface, char *out_ttyname) {
             }
             if (!is_usb_match(idVendor, idProduct))
                 continue;
-        
-            LOGD("find vid=0x%04x, pid=0x%04x", idVendor, idProduct);
+
+            snprintf(usbdevice_pah, sizeof(usbdevice_pah), "%s/%s", dir, ent->d_name);
+            LOGD("find %s vid=0x%04x, pid=0x%04x", usbdevice_pah, idVendor, idProduct);
             find_usb_device = 1;
             break;
         }
@@ -210,6 +212,16 @@ char *  ql_get_ttyPPP(char *out_ttyname) {
         return NULL;
     }
     return out_ttyname;
+}
+
+void ql_set_autosuspend(int enable) {
+    if (usbdevice_pah[0]) {
+        char shell_command[MAX_PATH+32];
+        snprintf(shell_command, sizeof(shell_command), "echo %s > %s/power/control", enable ? "auto" : "on", usbdevice_pah);
+        system(shell_command);
+        LOGD("%s", shell_command);
+        LOGD("%s %s", __func__, enable ? "auto" : "off");
+    }
 }
 
 static int chat(int fd, const char *at, const char *expect, int timeout, char **response) {
