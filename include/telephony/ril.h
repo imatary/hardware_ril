@@ -970,6 +970,15 @@ typedef struct {
   RIL_CDMA_InformationRecord infoRec[RIL_CDMA_MAX_NUMBER_OF_INFO_RECS];
 } RIL_CDMA_InformationRecords;
 
+typedef enum{
+	AUDIO_MODE_EARPHONE=0,
+	AUDIO_MODE_SPEAKER,	
+	AUDIO_MODE_HPWITHMIC,		
+	AUDIO_MODE_BT	,	
+	AUDIO_MODE_HPNOMIC,		
+	AUDIO_MODE_STOPPHONE,		
+}Modem_Audiotype;
+
 /**
  * RIL_REQUEST_GET_SIM_STATUS
  *
@@ -3568,6 +3577,11 @@ typedef struct {
  *
  */
 #define RIL_REQUEST_IMS_SEND_SMS 113
+
+#define RIL_REQUEST_SET_AUDIO_MODE 114
+#define RIL_REQUEST_GET_AUDIO_MODE 115
+#define RIL_REQUEST_SET_AUDIO_MODE_VOLUME 116
+#define RIL_REQUEST_GET_AUDIO_MODE_VOLUME 117
 
 /***********************************************************************/
 

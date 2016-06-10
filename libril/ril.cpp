@@ -51,6 +51,7 @@
 #include <cutils/properties.h>
 
 #include <ril_event.h>
+#include <linux/ioctl.h>
 
 namespace android {
 
@@ -85,6 +86,28 @@ namespace android {
 
 // request, response, and unsolicited msg print macro
 #define PRINTBUF_SIZE 8096
+/*for modem audio control*/
+#define MODEM_SOUND                   0x1B
+#define IOCTL_MODEM_EAR_PHOEN      	        _IO(MODEM_SOUND, 0x01)
+#define IOCTL_MODEM_SPK_PHONE      	        _IO(MODEM_SOUND, 0x02) 
+#define IOCTL_MODEM_HP_PHONE      	        _IO(MODEM_SOUND, 0x03)
+#define IOCTL_MODEM_BT_PHONE      	        _IO(MODEM_SOUND, 0x04)
+#define IOCTL_MODEM_STOP_PHONE      	        _IO(MODEM_SOUND, 0x05) 
+#define IOCTL_MODEM_HP_NOMIC_PHONE      	        _IO(MODEM_SOUND, 0x06) 
+#define IOCTL_SET_EAR_VALUME      	    _IO(MODEM_SOUND, 0x11) 
+#define IOCTL_SET_SPK_VALUME      	    _IO(MODEM_SOUND, 0x12) 
+#define IOCTL_SET_HP_VALUME      	    _IO(MODEM_SOUND, 0x13) 
+#define IOCTL_SET_BT_VALUME      	    _IO(MODEM_SOUND, 0x14) 
+#define IOCTL_SET_HP_NOMIC_VALUME   	        _IO(MODEM_SOUND, 0x15) 
+
+#define MODEM_DEV_PATH	  "/dev/voice_modem"
+
+#define BP_IOCTL_BASE 0x1a
+
+#define BP_IOCTL_RESET 		_IOW(BP_IOCTL_BASE, 0x01, int)
+#define BP_IOCTL_POWOFF 	_IOW(BP_IOCTL_BASE, 0x02, int)
+#define BP_IOCTL_POWON 		_IOW(BP_IOCTL_BASE, 0x03, int)
+#define BP_IOCTL_GET_BPID 	_IOR(BP_IOCTL_BASE, 0x07, int)
 
 // Enable RILC log
 #define RILC_LOG 1
@@ -197,6 +220,7 @@ static void dispatchVoid (Parcel& p, RequestInfo *pRI);
 static void dispatchString (Parcel& p, RequestInfo *pRI);
 static void dispatchStrings (Parcel& p, RequestInfo *pRI);
 static void dispatchInts (Parcel& p, RequestInfo *pRI);
+static void dispatchAudioMode(Parcel &p, RequestInfo *pRI);
 static void dispatchDial (Parcel& p, RequestInfo *pRI);
 static void dispatchSIM_IO (Parcel& p, RequestInfo *pRI);
 static void dispatchCallForward(Parcel& p, RequestInfo *pRI);
@@ -498,6 +522,115 @@ invalid:
     invalidCommandBlock(pRI);
     return;
 }
+
+static void modemSoundIoCtl(int cmd,int arg){
+	int arg1 = arg;
+	int fd_audio = open("/dev/modem_sound",O_RDWR|O_SYNC,777);
+	ALOGD("<-open fd_audio=%d,cmd=%d,arg=%d->",fd_audio,cmd,arg1);
+	if(fd_audio < 0) return;
+	int err = ioctl(fd_audio,cmd, &arg1);
+	close(fd_audio);
+}
+
+static void 
+dispatchAudioMode(Parcel &p, RequestInfo *pRI){
+    int32_t count;
+    status_t status;
+    size_t datalen;
+    int *pInts;
+    int arg = 1;
+	char has_earphone[PROP_VALUE_MAX]= {0};    
+    status = p.readInt32 (&count);
+
+    if (status != NO_ERROR || count == 0) {
+        goto invalid;
+    }
+
+    datalen = sizeof(int) * count;
+    pInts = (int *)alloca(datalen);
+
+    startRequest;
+    for (int i = 0 ; i < count ; i++) {
+        int32_t t;
+
+        status = p.readInt32(&t);
+        pInts[i] = (int)t;
+        appendPrintBuf("%s%d,", printBuf, t);
+
+        if (status != NO_ERROR) {
+            goto invalid;
+        }
+   }
+   removeLastChar;
+   closeRequest;
+   	
+	
+   
+   printRequest(pRI->token, pRI->pCI->requestNumber);
+   property_get("ro.ap_has_earphone", has_earphone, "1");
+   if(strcmp(has_earphone, "1") != 0 && pInts[0] == AUDIO_MODE_EARPHONE){
+  		pInts[0] = AUDIO_MODE_SPEAKER;
+   	}
+   RLOGD("<-dispatchAudioMode pInts[0]=%d   ,has_earphone = %s->",pInts[0],has_earphone);
+   //s_callbacks.onRequest(pRI->pCI->requestNumber, const_cast<int *>(pInts),
+   //                    datalen, pRI);
+RLOGD("<-dispatchAudioMode pInts[0]=%d->",pInts[0]);
+   
+   
+   switch(pInts[0]){
+	case AUDIO_MODE_EARPHONE:
+		if(count > 1){			
+			modemSoundIoCtl(IOCTL_SET_EAR_VALUME,pInts[1]);
+		}else{
+			modemSoundIoCtl(IOCTL_MODEM_EAR_PHOEN, arg);
+		}
+		break;
+	case AUDIO_MODE_SPEAKER:
+		if(count > 1){			
+			modemSoundIoCtl(IOCTL_SET_SPK_VALUME,pInts[1]);
+		}else{
+			modemSoundIoCtl(IOCTL_MODEM_SPK_PHONE, arg);			
+		}
+		break;
+	case AUDIO_MODE_HPNOMIC:
+		if(count > 1){			
+			modemSoundIoCtl(IOCTL_SET_HP_NOMIC_VALUME,pInts[1]);
+		}else{
+			modemSoundIoCtl(IOCTL_MODEM_HP_NOMIC_PHONE, arg);
+		}
+		break;
+	case AUDIO_MODE_HPWITHMIC:
+		if(count > 1){			
+			modemSoundIoCtl(IOCTL_SET_HP_VALUME,pInts[1]);
+		}else{
+			modemSoundIoCtl(IOCTL_MODEM_HP_PHONE, arg);
+		}
+		break;
+	case AUDIO_MODE_BT:
+		if(count > 1){			
+			modemSoundIoCtl(IOCTL_SET_BT_VALUME,pInts[1]);
+		}else{
+			modemSoundIoCtl(IOCTL_MODEM_BT_PHONE, arg);
+		}
+		break;
+	case AUDIO_MODE_STOPPHONE:
+		//sleep(2);
+		modemSoundIoCtl(IOCTL_MODEM_STOP_PHONE, arg);		
+		break;
+   }
+   s_callbacks.onRequest(pRI->pCI->requestNumber, const_cast<int *>(pInts),
+                       datalen, pRI);
+
+#ifdef MEMSET_FREED
+    memset(pInts, 0, datalen);
+#endif
+
+    return;
+invalid:
+    invalidCommandBlock(pRI);
+    return;	
+}
+
 
 /** Callee expects const int * */
 static void
@@ -3875,7 +4008,12 @@ requestToString(int request) {
         case RIL_UNSOL_VOICE_RADIO_TECH_CHANGED: return "UNSOL_VOICE_RADIO_TECH_CHANGED";
         case RIL_UNSOL_CELL_INFO_LIST: return "UNSOL_CELL_INFO_LIST";
         case RIL_UNSOL_RESPONSE_IMS_NETWORK_STATE_CHANGED: return "RESPONSE_IMS_NETWORK_STATE_CHANGED";
-        default: return "<unknown request>";
+        case RIL_REQUEST_SET_AUDIO_MODE:return "SET_AUDIO_MODE";
+		case RIL_REQUEST_GET_AUDIO_MODE:return "GET_AUDIO_MODE";
+		case RIL_REQUEST_SET_AUDIO_MODE_VOLUME: return "SET_AUDIO_MODE_VOLUME";
+		case RIL_REQUEST_GET_AUDIO_MODE_VOLUME: return "GET_AUDIO_MODE_VOLUME";
+		default: return "<unknown request>";
+
     }
 }
 

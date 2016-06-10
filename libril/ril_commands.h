@@ -128,3 +128,8 @@
     {RIL_REQUEST_SET_INITIAL_ATTACH_APN, dispatchSetInitialAttachApn, responseVoid},
     {RIL_REQUEST_IMS_REGISTRATION_STATE, dispatchVoid, responseInts},
     {RIL_REQUEST_IMS_SEND_SMS, dispatchImsSms, responseSMS},
+	{RIL_REQUEST_SET_AUDIO_MODE, dispatchAudioMode, responseInts},
+	{RIL_REQUEST_GET_AUDIO_MODE, dispatchVoid, responseInts},
+	{RIL_REQUEST_SET_AUDIO_MODE_VOLUME, dispatchAudioMode, responseInts},
+	{RIL_REQUEST_GET_AUDIO_MODE_VOLUME, dispatchInts, responseInts},
+

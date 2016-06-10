@@ -137,6 +137,14 @@ static struct modem_3g_device modem_3g_device_table[] = {
 		.dataport	= "NOTUSED",
 		.type		= MC9090_MODEM,
 	},
+	{
+		.name		= "INNO",
+		.idVendor	= "1d53",
+		.idProduct	= "3d53",
+		.deviceport     = "NOTUSED",
+		.dataport	= "NOTUSED",
+		.type		= INNO_MODEM,
+	},	
 };
 
 /* -------------------------------------------------------------- */

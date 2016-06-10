@@ -31,6 +31,7 @@
 #include <cutils/sockets.h>
 #include <sys/capability.h>
 #include <linux/prctl.h>
+#include <sys/ioctl.h>
 
 #include <private/android_filesystem_config.h>
 #include "hardware/qemu_pipe.h"
@@ -38,13 +39,29 @@
 
 #define LIB_PATH_PROPERTY   "rild.libpath"
 #define LIB_ARGS_PROPERTY   "rild.libargs"
+#define MODEM_DEV_PATH	  "/dev/voice_modem"
 #define MAX_LIB_ARGS        16
+
+#define BP_IOCTL_BASE 0x1a
+
+#define BP_IOCTL_RESET 		_IOW(BP_IOCTL_BASE, 0x01, int)
+#define BP_IOCTL_POWOFF 	_IOW(BP_IOCTL_BASE, 0x02, int)
+#define BP_IOCTL_POWON 		_IOW(BP_IOCTL_BASE, 0x03, int)
+
+#define BP_IOCTL_WRITE_STATUS 	_IOW(BP_IOCTL_BASE, 0x04, int)
+#define BP_IOCTL_GET_STATUS 	_IOR(BP_IOCTL_BASE, 0x05, int)
+#define BP_IOCTL_SET_PVID 	_IOW(BP_IOCTL_BASE, 0x06, int)
+#define BP_IOCTL_GET_BPID 	_IOR(BP_IOCTL_BASE, 0x07, int)
+
+
 #define MAX_POLL_DEVICE_CNT 160
 #define REFERENCE_RIL_DEF_PATH "/system/lib/libreference-ril.so"
 #define REFERENCE_RIL_ZTE_PATH "/system/lib/libreference-ril-zte.so"
 #define REFERENCE_RIL_MC9090_AT_PATH "/system/lib/libsierraat-ril.so"
 #define REFERENCE_RIL_MC9090_QMI_PATH "/system/lib/libsierra-ril.so"
 #define REFERENCE_RIL_MC9090_HL_PATH "/system/lib/libsierrahl-ril.so"
+#define REFERENCE_RIL_INNO_AT_PATH "/system/lib/libinnofidei-ril.so"
+
 #define MC9090_PROP_NAME "mc9090.work_type"
 static void usage(const char *argv0)
 {
@@ -103,6 +120,37 @@ void switchUser() {
     cap.effective = cap.permitted = (1 << CAP_NET_ADMIN) | (1 << CAP_NET_RAW);
     cap.inheritable = 0;
     capset(&header, &cap);
+}
+int getBpID(){
+	int bp_fd = -1;
+	int biID =-1;
+	int err = -1;
+	bp_fd = open(MODEM_DEV_PATH, O_RDWR);
+	if(bp_fd > 0){		
+		err = ioctl(bp_fd,BP_IOCTL_GET_BPID,&biID);
+		if(err < 0){
+			RLOGE("biID=%d getBpID failed  ioctrl err =%d bp_fd=%d",biID,err,bp_fd);
+			close(bp_fd);
+			return -1;
+		}else{
+			RLOGD("biID=%d getBpID sucessed",biID);
+			close(bp_fd);
+			return biID;
+		} 
+	}
+	RLOGE("biID=%d getBpID failed bp_fd = ",biID,bp_fd);
+	return -1;	
+}
+void startmux(int bp_id){
+	char *muxbin =NULL;
+	if(bp_id < 0){
+		RLOGE("bp_id=%d cann`t found mux bin to start",bp_id);
+	}else{
+		asprintf(&muxbin, "muxd%d",bp_id); 
+		property_set("ctl.start",muxbin); 
+		RLOGD("bp_id=%d found %s to start",bp_id,muxbin);
+		free(muxbin);
+	}
 }
 
 int main(int argc, char **argv)
@@ -169,8 +217,12 @@ int main(int argc, char **argv)
 			rilLibPath = REFERENCE_RIL_MC9090_AT_PATH;
 		RLOGE("ril worktype =%s\n", workType);
 		break;
+		case INNO_MODEM:
+			rilLibPath = REFERENCE_RIL_INNO_AT_PATH;
+		break;
 		case HUAWEI_MODEM:
 		case AMAZON_MODEM:
+		case EC20_MODEM:
 		default:
 			if (!rilLibPath)
 				rilLibPath = REFERENCE_RIL_DEF_PATH;
@@ -294,9 +346,14 @@ int main(int argc, char **argv)
     }
 OpenLib:
 #endif
-#ifndef MODEM_EC20
-    switchUser();
-#endif
+	if (modem_type == INNO_MODEM){
+		int bpID = getBpID();
+		startmux(bpID);
+	}
+//#ifndef MODEM_EC20
+	if ((modem_type != EC20_MODEM) && (modem_type != INNO_MODEM))
+    	switchUser();
+//#endif
     dlHandle = dlopen(rilLibPath, RTLD_NOW);
 
     if (dlHandle == NULL) {
