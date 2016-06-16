@@ -2776,7 +2776,15 @@ static void requestScreenState(void *data, size_t datalen, RIL_Token t)
         }
     }
 #endif
-
+    if (ql_is_EC20) {
+        if (!(((int *)data)[0])) {
+            at_send_command("AT+CREG=0", NULL);
+            at_send_command("AT+CGREG=0", NULL);
+        }else{
+            at_send_command("AT+CREG=2", NULL);
+            at_send_command("AT+CGREG=2", NULL);
+        }
+    }
     //Add by Wythe.WANG for XingWang test 2016/1/20
     //Use AT^DATAMODE here to check whether the ppp linker is still alive on modem side
     if(ql_is_EC20 && (((int *)data)[0]) && !strcmp(PPP_TTY_PATH, "ppp0") && !access("/sys/class/net/ppp0", R_OK))
