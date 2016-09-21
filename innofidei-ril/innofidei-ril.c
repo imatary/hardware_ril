@@ -2410,6 +2410,9 @@ onRequest (int request, void *data, size_t datalen, RIL_Token t)
         case RIL_REQUEST_SET_UNSOL_CELL_INFO_LIST_RATE:
             requestSetCellInfoListRate(data, datalen, t);
             break;
+	case RIL_REQUEST_SCREEN_STATE 
+	    RLOGD("need ril vender to do........."): 
+            RIL_onRequestComplete(t, RIL_E_SUCCESS, NULL, 0);
         default:
             RLOGD("Request not supported. Tech: %d",TECH(sMdmInfo));
             RIL_onRequestComplete(t, RIL_E_REQUEST_NOT_SUPPORTED, NULL, 0);
